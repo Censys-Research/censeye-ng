@@ -193,7 +193,6 @@ filters:
     - host.services.endpoints.prometheus_target.metric_families.help
     - host.services.jarm.cipher_and_version_fingerprint
     - host.services.endpoints.pprof.
-    - host.services.ja4tscan.fingerprint
     - host.services.smb.smb_version.version_string
     - host.services.cert.parsed.ja4x
     - host.services.l2tp.sccrp.attribute_values.

@@ -190,7 +190,6 @@ var DefaultFilters = []string{
 	"host.services.endpoints.prometheus_target.metric_families.help", // we have the prom name, which is enough.
 	"host.services.jarm.cipher_and_version_fingerprint",              // we already have the jarm fingerprint.
 	"host.services.endpoints.pprof.",                                 // no.
-	"host.services.ja4tscan.fingerprint",                             // unnessary, we have ja4x.
 	"host.services.smb.smb_version.version_string",                   // not useful
 	"host.services.cert.parsed.ja4x",                                 // not useful, we have the ja4x fingerprint.
 	"host.services.l2tp.sccrp.attribute_values.",                     // not useful
