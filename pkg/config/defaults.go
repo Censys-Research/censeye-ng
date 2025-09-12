@@ -44,6 +44,9 @@ var DefaultExtractionRules = []*ExtractionRule{
 	{
 		Fields: []string{"banner_hash_sha256", "protocol"},
 	},
+	{
+		Fields: []string{"ja4tscan.fingerprint", "banner_hash_sha256"},
+	},
 }
 
 // these are things we want to filter out (by default) from the rule generation
