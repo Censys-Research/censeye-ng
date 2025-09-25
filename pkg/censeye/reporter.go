@@ -99,23 +99,9 @@ func (r *Reporter) linkQuery(q string) string {
 		return q
 	}
 
-	qorig := q
-
-	if r.termWidth < 50 {
-		if len(q) > 20 {
-			return q[:20] + "..."
-		}
-		return q
-	}
-
-	maxLen := int(max(float64(r.termWidth-50), 0))
-	if len(q) > maxLen {
-		q = q[:maxLen] + "..."
-	}
-
 	return fmt.Sprintf("%s %s",
-		termlink.Link("⮺",
-			fmt.Sprintf("https://platform.censys.io/search?q=%s", url.QueryEscape(qorig))), q)
+		termlink.Link("🔗",
+			fmt.Sprintf("https://platform.censys.io/search?q=%s", url.QueryEscape(q))), q)
 }
 
 func (r *Reporter) colorize(entry *reportEntry, key, val, count string) (string, string, string) {
@@ -187,7 +173,7 @@ func (r *Reporter) formatViaQuery(query string) string {
 		viaColor := color.New(color.FgCyan)
 
 		// If there's a hyperlink, we need to be careful not to color the link symbol
-		if r.useLinks && strings.Contains(linked, "⮺") {
+		if r.useLinks && strings.Contains(linked, "🔗") {
 			// Split on the hyperlink symbol and colorize only the query part
 			parts := strings.SplitN(linked, " ", 2)
 			if len(parts) == 2 {
@@ -272,10 +258,23 @@ func (r *Reporter) Table(report *Report) {
 	})
 	t.SetOutputMirror(r.w)
 
-	if r.useLinks {
-		t.AppendHeader(table.Row{"🔗", "Hosts", "Key", "Val"})
+	// Check if this is a multi-IP analysis report
+	isMultiIP := strings.HasPrefix(report.Host, "MultiIP-Analysis-")
+
+	if isMultiIP {
+		// Multi-IP report format with host_set column
+		if r.useLinks {
+			t.AppendHeader(table.Row{"🔗", "Host_Set", "Hosts", "Key", "Val"})
+		} else {
+			t.AppendHeader(table.Row{"Host_Set", "Hosts", "Key", "Val"})
+		}
 	} else {
-		t.AppendHeader(table.Row{"Hosts", "Key", "Val"})
+		// Standard single-IP report format
+		if r.useLinks {
+			t.AppendHeader(table.Row{"🔗", "Hosts", "Key", "Val"})
+		} else {
+			t.AppendHeader(table.Row{"Hosts", "Key", "Val"})
+		}
 	}
 
 	wid := r.termWidth
@@ -300,21 +299,46 @@ func (r *Reporter) Table(report *Report) {
 		key, val, count := entry.ToCenqlShort()
 		key = strings.TrimPrefix(key, "host.services.")
 		key = strings.TrimPrefix(key, "endpoints.")
-		cfmt, key, val := r.colorize(entry, key, val, strconv.FormatInt(count, 10))
 
-		if r.useLinks {
-			t.AppendRow(table.Row{
-				termlink.Link("⮺", entry.GetSearchURL()),
-				cfmt,
-				key,
-				text.WrapText(val, valColWidth),
-			})
+		if isMultiIP {
+			// For multi-IP reports, use the HostSetCount from the entry
+			hostSetCount := strconv.Itoa(entry.GetHostSetCount())
+			cfmt, key, val := r.colorize(entry, key, val, strconv.FormatInt(count, 10))
+
+			if r.useLinks {
+				t.AppendRow(table.Row{
+					termlink.Link("🔗", entry.GetSearchURL()),
+					hostSetCount, // Host_Set column
+					cfmt,         // Hosts column (total in Censys)
+					key,
+					text.WrapText(val, valColWidth),
+				})
+			} else {
+				t.AppendRow(table.Row{
+					hostSetCount, // Host_Set column
+					cfmt,         // Hosts column (total in Censys)
+					key,
+					text.WrapText(val, valColWidth),
+				})
+			}
 		} else {
-			t.AppendRow(table.Row{
-				cfmt,
-				key,
-				text.WrapText(val, valColWidth),
-			})
+			// Standard single-IP report format
+			cfmt, key, val := r.colorize(entry, key, val, strconv.FormatInt(count, 10))
+
+			if r.useLinks {
+				t.AppendRow(table.Row{
+					termlink.Link("🔗", entry.GetSearchURL()),
+					cfmt,
+					key,
+					text.WrapText(val, valColWidth),
+				})
+			} else {
+				t.AppendRow(table.Row{
+					cfmt,
+					key,
+					text.WrapText(val, valColWidth),
+				})
+			}
 		}
 	}
 
@@ -340,14 +364,21 @@ func (r *Reporter) Table(report *Report) {
 		allVia += viaEntry.GetCenqlQuery() + ", "
 	}
 
-	hostWithTags := r.formatHostWithTags(host, report.Labels, report.Threats)
-	fmt.Fprintf(r.w, "\n%s (depth: %d) (via: %s -- %s)\n", hostWithTags, report.GetDepth(), viah, via)
+	if isMultiIP {
+		// Multi-IP analysis header
+		fmt.Fprintf(r.w, "\n%s\n", report.Host)
+		fmt.Fprintln(r.w, "Common Attributes Analysis:")
+	} else {
+		// Standard single-IP header
+		hostWithTags := r.formatHostWithTags(host, report.Labels, report.Threats)
+		fmt.Fprintf(r.w, "\n%s (depth: %d) (via: %s -- %s)\n", hostWithTags, report.GetDepth(), viah, via)
 
-	if report.GetReferrer() != nil {
-		fmt.Fprintf(r.w, "Parent IP: %s\n", r.linkHost(viah))
-		fmt.Fprintln(r.w, "All matching queries:")
-		for _, viaEntry := range report.GetReferrer().GetAllVia() {
-			fmt.Fprintf(r.w, " - %s\n", r.formatViaQuery(viaEntry.GetCenqlQuery()))
+		if report.GetReferrer() != nil {
+			fmt.Fprintf(r.w, "Parent IP: %s\n", r.linkHost(viah))
+			fmt.Fprintln(r.w, "All matching queries:")
+			for _, viaEntry := range report.GetReferrer().GetAllVia() {
+				fmt.Fprintf(r.w, " - %s\n", r.formatViaQuery(viaEntry.GetCenqlQuery()))
+			}
 		}
 	}
 
@@ -490,11 +521,8 @@ func (r *Reporter) printPivot(p iPivot) {
 	query := p.cenqlQuery
 
 	if r.useLinks {
-		maxLen := r.termWidth - 30
-		if len(query) > maxLen {
-			query = query[:maxLen] + "..."
-		}
-		query = fmt.Sprintf("%s %s", termlink.Link("⮺", p.searchURL), query)
+		// Don't truncate by default - users want to see full queries
+		query = fmt.Sprintf("%s %s", termlink.Link("🔗", p.searchURL), query)
 	}
 
 	fmt.Fprintf(r.w, " - [%5d] %s\n", p.count, query)

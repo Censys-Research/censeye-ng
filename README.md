@@ -63,6 +63,7 @@ Flags:
   -C, --cache-duration duration   Duration to keep the cache (default: 23h) (default 168h0m0s)
   -c, --config string             Path to the configuration file
   -d, --depth int                 Depth of the scan (default: 0)
+  -f, --file string               File containing IP addresses (one per line or comma-separated)
   -h, --help                      help for censeye-ng
   -L, --log-level string          Log level (debug, info*, warn, error, fatal, panic)
       --no-color                  Disable colored output
@@ -84,6 +85,8 @@ CENSYS_PLATFORM_ORGID=$YOUR_ORG_ID
 
 ### Example
 
+#### Single Host Analysis
+
 ```bash
 $ censeye-ng 159.75.155.46 --depth 2
 ```
@@ -91,6 +94,58 @@ $ censeye-ng 159.75.155.46 --depth 2
 This will collect the host information from `159.75.155.46` from Censys, generate a list of all possible pivot fields, optimize and filter them, generate a valid ValueCounts query, and then execute it against the Censys Platform API. Then, since the `--depth` is set to `2`, it will recursively pivot on the results, collecting more information and generating new queries until the depth limit is reached. By default, the depth is set to `0`, which means no recursive pivoting will occur.
 
 It should be noted that when the depth is greater than zero, the API will be queried in parallel, which can significantly speed up the process. The number of parallel queries can be controlled with the `--parallel` flag (default is `2`).
+
+#### Multi-IP Common Attribute Analysis
+
+Censeye-NG supports multiple input methods for analyzing common attributes across multiple hosts:
+
+**Direct arguments (handles spaces gracefully):**
+```bash
+$ censeye-ng "1.2.3.4, 5.6.7.8, 9.10.11.12"
+$ censeye-ng 1.2.3.4,5.6.7.8,9.10.11.12
+```
+
+**File input (one IP per line or comma-separated):**
+```bash
+$ censeye-ng -f ips.txt
+$ censeye-ng --file ips.txt
+```
+
+Where `ips.txt` can contain:
+```
+1.2.3.4
+5.6.7.8
+9.10.11.12
+```
+or
+```
+1.2.3.4, 5.6.7.8, 9.10.11.12
+```
+
+**Stdin input (original method):**
+```bash
+$ echo "1.2.3.4,5.6.7.8,9.10.11.12" | censeye-ng
+```
+
+All methods analyze the provided IP addresses to find common attributes across all hosts. The output shows:
+
+- **Host_Set**: How many of the provided IPs share this attribute
+- **Hosts**: Total count of this attribute in the global Censys dataset
+
+This helps identify distinctive characteristics shared across a cluster of hosts. For example:
+
+```
+Common Attributes Analysis:
+🔗    Host_Set  Hosts    Key                    Val
+      3         46       cert.issuer_dn         "C=Earth, ST=Cyberspace..."
+      3         150000   protocol               "HTTP"
+```
+
+In this example:
+- First row: All 3 IPs share a certificate issuer, but only 46 total hosts globally have it → **distinctive attribute**
+- Second row: All 3 IPs use HTTP, but 150k hosts globally use HTTP → **common, not distinctive**
+
+Note: Multi-IP mode does not support the `--depth` flag as recursive pivoting would be ambiguous with multiple starting points.
 
 ## Interpreting a report
 

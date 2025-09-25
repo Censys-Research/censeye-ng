@@ -41,6 +41,7 @@ var (
 	atTime          string                        // fetch historical information from a specific host
 	showConf        = false                       // show the configuration file in yaml format before running the command
 	pivotableFields []string                      // fields that should be considered for pivoting when depth > 1
+	inputFile       string                        // file containing IPs to analyze (one per line or comma-separated)
 )
 
 func report(w io.Writer, rep []*censeye.Report) {
@@ -117,6 +118,43 @@ func parseIP(s string) string {
 	}
 
 	return strings.TrimSpace(s)
+}
+
+// parseIPList parses a string containing multiple IPs separated by commas or newlines
+// Handles spaces gracefully and returns a slice of clean IPs
+func parseIPList(input string) []string {
+	var ips []string
+
+	// First split by newlines to handle file input format
+	lines := strings.Split(input, "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Then split each line by commas
+		parts := strings.Split(line, ",")
+		for _, part := range parts {
+			cleanIP := parseIP(part)
+			if cleanIP != "" {
+				ips = append(ips, cleanIP)
+			}
+		}
+	}
+
+	return ips
+}
+
+// readIPsFromFile reads IPs from a file, supporting both line-separated and comma-separated formats
+func readIPsFromFile(filename string) ([]string, error) {
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("error reading file %s: %w", filename, err)
+	}
+
+	return parseIPList(string(content)), nil
 }
 
 func runCenseye(cmd *cobra.Command, args []string) {
@@ -204,38 +242,85 @@ func runCenseye(cmd *cobra.Command, args []string) {
 		return opts
 	}
 
-	if len(args) == 0 {
-		if depth > 0 {
-			// i mean, technically we could do this, but it's really annoying to understand
-			// but i can be convinced otherwise.
-			log.Fatalf("depth cannot be set when reading from stdin")
+	// Determine input source and parse IPs
+	var allIPs []string
+
+	if inputFile != "" {
+		// File input mode
+		if len(args) > 0 {
+			log.Fatalf("cannot specify both file input and command line arguments")
 		}
-
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			host := parseIP(scanner.Text())
-			if host == "" {
-				continue
+		allIPs, err = readIPsFromFile(inputFile)
+		if err != nil {
+			log.Fatalf("error reading input file: %v", err)
+		}
+	} else if len(args) > 0 {
+		// Command line arguments
+		if len(args) == 1 && strings.Contains(args[0], ",") {
+			// Single argument with comma-separated IPs
+			allIPs = parseIPList(args[0])
+		} else {
+			// Multiple arguments or single IP
+			for _, arg := range args {
+				cleanIP := parseIP(arg)
+				if cleanIP != "" {
+					allIPs = append(allIPs, cleanIP)
+				}
 			}
-			log.Infof("processing host: %s", host)
-
-			res, err := ce.Run(ctx, host, buildOpts()...)
-			stopSpinner()
-
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error running censeye for %s: %v\n", host, err)
-				continue
-			}
-
-			report(os.Stdout, res)
 		}
 	} else {
-		host := parseIP(args[0])
+		// Stdin input mode
+		scanner := bufio.NewScanner(os.Stdin)
+		var allInputs []string
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line != "" {
+				allInputs = append(allInputs, line)
+			}
+		}
+
+		if len(allInputs) == 0 {
+			log.Fatalf("no input provided")
+		}
+
+		// Parse all stdin input
+		allInput := strings.Join(allInputs, "\n")
+		allIPs = parseIPList(allInput)
+	}
+
+	if len(allIPs) == 0 {
+		log.Fatalf("no valid IP addresses found in input")
+	}
+
+	// Determine if this is multi-IP mode
+	multiIPMode := len(allIPs) > 1
+
+	if multiIPMode && depth > 0 {
+		log.Fatalf("depth cannot be set in multi-IP mode (unclear which common attributes to pivot on)")
+	}
+
+	if multiIPMode {
+		// Multi-IP analysis mode
+		log.Infof("processing %d hosts for common attribute analysis", len(allIPs))
+		res, err := ce.RunMultiIP(ctx, allIPs, buildOpts()...)
+		stopSpinner()
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error running multi-IP censeye: %v\n", err)
+			log.Fatalf("error running multi-IP censeye: %v", err)
+		}
+
+		report(os.Stdout, res)
+	} else {
+		// Single-IP mode
+		host := allIPs[0]
+		log.Infof("processing host: %s", host)
+
 		res, err := ce.Run(ctx, host, buildOpts()...)
 		stopSpinner()
 
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error running censeye: %v\n", err)
+			fmt.Fprintf(os.Stderr, "error running censeye for %s: %v\n", host, err)
 			log.Fatalf("error running censeye: %v", err)
 		}
 
@@ -312,6 +397,7 @@ func init() {
 	rootCmd.Flags().StringVarP(&atTime, "at", "a", "", "Fetch host data from a specific date (e.g., '2023-10-01 12:00:00')")
 	rootCmd.Flags().StringVar(&atTime, "at-time", "", "alias for --at")
 	rootCmd.Flags().BoolVar(&showConf, "showconf", showConf, "Show the configuration file in YAML format before running the command")
+	rootCmd.Flags().StringVarP(&inputFile, "file", "f", "", "File containing IP addresses (one per line or comma-separated)")
 
 	cobra.OnInitialize(initLogging)
 }
