@@ -100,7 +100,7 @@ func (r *Reporter) linkQuery(q string) string {
 	}
 
 	return fmt.Sprintf("%s %s",
-		termlink.Link("🔗",
+		termlink.Link("→",
 			fmt.Sprintf("https://platform.censys.io/search?q=%s", url.QueryEscape(q))), q)
 }
 
@@ -173,7 +173,7 @@ func (r *Reporter) formatViaQuery(query string) string {
 		viaColor := color.New(color.FgCyan)
 
 		// If there's a hyperlink, we need to be careful not to color the link symbol
-		if r.useLinks && strings.Contains(linked, "🔗") {
+		if r.useLinks && strings.Contains(linked, "→") {
 			// Split on the hyperlink symbol and colorize only the query part
 			parts := strings.SplitN(linked, " ", 2)
 			if len(parts) == 2 {
@@ -264,14 +264,14 @@ func (r *Reporter) Table(report *Report) {
 	if isMultiIP {
 		// Multi-IP report format with host_set column
 		if r.useLinks {
-			t.AppendHeader(table.Row{"🔗", "Host_Set", "Hosts", "Key", "Val"})
+			t.AppendHeader(table.Row{"→", "Host_Set", "Hosts", "Key", "Val"})
 		} else {
 			t.AppendHeader(table.Row{"Host_Set", "Hosts", "Key", "Val"})
 		}
 	} else {
 		// Standard single-IP report format
 		if r.useLinks {
-			t.AppendHeader(table.Row{"🔗", "Hosts", "Key", "Val"})
+			t.AppendHeader(table.Row{"→", "Hosts", "Key", "Val"})
 		} else {
 			t.AppendHeader(table.Row{"Hosts", "Key", "Val"})
 		}
@@ -307,7 +307,7 @@ func (r *Reporter) Table(report *Report) {
 
 			if r.useLinks {
 				t.AppendRow(table.Row{
-					termlink.Link("🔗", entry.GetSearchURL()),
+					termlink.Link("→", entry.GetSearchURL()),
 					hostSetCount, // Host_Set column
 					cfmt,         // Hosts column (total in Censys)
 					key,
@@ -327,7 +327,7 @@ func (r *Reporter) Table(report *Report) {
 
 			if r.useLinks {
 				t.AppendRow(table.Row{
-					termlink.Link("🔗", entry.GetSearchURL()),
+					termlink.Link("→", entry.GetSearchURL()),
 					cfmt,
 					key,
 					text.WrapText(val, valColWidth),
@@ -522,7 +522,7 @@ func (r *Reporter) printPivot(p iPivot) {
 
 	if r.useLinks {
 		// Don't truncate by default - users want to see full queries
-		query = fmt.Sprintf("%s %s", termlink.Link("🔗", p.searchURL), query)
+		query = fmt.Sprintf("%s %s", termlink.Link("→", p.searchURL), query)
 	}
 
 	fmt.Fprintf(r.w, " - [%5d] %s\n", p.count, query)

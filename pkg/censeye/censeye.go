@@ -23,7 +23,6 @@ import (
 
 const (
 	hostPfx    = "host"
-	webPfx     = "web"
 	defaultPfx = hostPfx
 )
 
@@ -126,9 +125,6 @@ func (c *Censeye) Run(ctx context.Context, host string, opts ...RunOpt) ([]*Repo
 	return c.run(ctx, host, opts...)
 }
 
-// RunMultiIP analyzes multiple IPs to find common attributes and their prevalence
-// in the global dataset. This helps identify distinctive characteristics shared
-// across a set of hosts.
 func (c *Censeye) RunMultiIP(ctx context.Context, hosts []string, opts ...RunOpt) ([]*Report, error) {
 	ro := &runOpts{}
 	for _, opt := range opts {
@@ -141,7 +137,6 @@ func (c *Censeye) RunMultiIP(ctx context.Context, hosts []string, opts ...RunOpt
 
 	c.sendStatus(fmt.Sprintf("analyzing %d hosts for common attributes", len(hosts)))
 
-	// Step 1: Gather data for all hosts
 	hostData := make(map[string]gjson.Result)
 	totalCredits := 0
 
@@ -163,7 +158,6 @@ func (c *Censeye) RunMultiIP(ctx context.Context, hosts []string, opts ...RunOpt
 
 	c.sendStatus("analyzing common attributes across hosts")
 
-	// Step 2: Find common attributes
 	commonAttribs, err := c.findCommonAttributes(hostData)
 	if err != nil {
 		return nil, fmt.Errorf("error finding common attributes: %w", err)
@@ -182,7 +176,6 @@ func (c *Censeye) RunMultiIP(ctx context.Context, hosts []string, opts ...RunOpt
 		return []*Report{report}, nil
 	}
 
-	// Step 3: Get counts for common attributes
 	c.sendStatus(fmt.Sprintf("getting global counts for %d common attributes", len(commonAttribs)))
 
 	rules := make([][]components.FieldValuePair, len(commonAttribs))
@@ -197,26 +190,12 @@ func (c *Censeye) RunMultiIP(ctx context.Context, hosts []string, opts ...RunOpt
 
 	totalCredits += countReport.Credits
 
-	// Step 4: Merge the results
 	for i, entry := range countReport.Data {
 		if i < len(commonAttribs) {
-			commonAttribs[i].TotalCount = entry.Count
+			commonAttribs[i].Count = entry.Count
 			commonAttribs[i].SearchURL = entry.SearchURL
 			commonAttribs[i].CenqlQuery = entry.CenqlQuery
 			commonAttribs[i].IsInteresting = entry.IsInteresting
-		}
-	}
-
-	// Step 5: Convert to standard Report format for output compatibility
-	reportEntries := make([]*reportEntry, len(commonAttribs))
-	for i, attr := range commonAttribs {
-		reportEntries[i] = &reportEntry{
-			Pairs:         attr.Pairs,
-			Count:         attr.TotalCount,
-			SearchURL:     attr.SearchURL,
-			CenqlQuery:    attr.CenqlQuery,
-			IsInteresting: attr.IsInteresting,
-			HostSetCount:  attr.HostSetCount, // Include the host set count
 		}
 	}
 
@@ -225,7 +204,7 @@ func (c *Censeye) RunMultiIP(ctx context.Context, hosts []string, opts ...RunOpt
 		AtTime:  ro.atTime,
 		Credits: totalCredits,
 		Depth:   0,
-		Data:    reportEntries,
+		Data:    commonAttribs,
 	}
 
 	c.sendStatus("multi-IP analysis complete")
@@ -429,10 +408,7 @@ func (c *Censeye) run(ctx context.Context, startHost string, opts ...RunOpt) ([]
 	return reports, nil
 }
 
-// findCommonAttributes analyzes multiple host datasets to find attributes that are
-// common across them. Returns a slice of commonAttributeEntry with host set counts.
-func (c *Censeye) findCommonAttributes(hostData map[string]gjson.Result) ([]*commonAttributeEntry, error) {
-	// Step 1: Generate rules for each host
+func (c *Censeye) findCommonAttributes(hostData map[string]gjson.Result) ([]*reportEntry, error) {
 	hostRules := make(map[string][][]components.FieldValuePair)
 
 	for host, data := range hostData {
@@ -444,7 +420,6 @@ func (c *Censeye) findCommonAttributes(hostData map[string]gjson.Result) ([]*com
 		hostRules[host] = rules
 	}
 
-	// Step 2: Create a signature for each rule (for comparison)
 	type ruleSignature struct {
 		pairs []components.FieldValuePair
 		hosts []string
@@ -452,17 +427,14 @@ func (c *Censeye) findCommonAttributes(hostData map[string]gjson.Result) ([]*com
 
 	ruleMap := make(map[string]*ruleSignature)
 
-	// Create a signature string from field-value pairs
 	serializeRule := func(pairs []components.FieldValuePair) string {
 		if len(pairs) == 0 {
 			return ""
 		}
 
-		// Sort pairs to ensure consistent signatures
 		sorted := make([]components.FieldValuePair, len(pairs))
 		copy(sorted, pairs)
 
-		// Simple sort by field name then value
 		for i := 0; i < len(sorted)-1; i++ {
 			for j := i + 1; j < len(sorted); j++ {
 				if sorted[i].Field > sorted[j].Field ||
@@ -479,7 +451,6 @@ func (c *Censeye) findCommonAttributes(hostData map[string]gjson.Result) ([]*com
 		return strings.Join(parts, "|")
 	}
 
-	// Step 3: Collect all rules and track which hosts have each rule
 	for host, rules := range hostRules {
 		for _, rule := range rules {
 			sig := serializeRule(rule)
@@ -498,22 +469,19 @@ func (c *Censeye) findCommonAttributes(hostData map[string]gjson.Result) ([]*com
 		}
 	}
 
-	// Step 4: Filter to only attributes that are common to multiple hosts
-	var commonAttribs []*commonAttributeEntry
+	var commonAttribs []*reportEntry
 	totalHosts := len(hostData)
 
 	for _, ruleSig := range ruleMap {
 		hostSetCount := len(ruleSig.hosts)
 
-		// Only include attributes present in at least 2 hosts (or configurable threshold)
 		if hostSetCount >= 2 {
-			entry := &commonAttributeEntry{
+			entry := &reportEntry{
 				Pairs:        ruleSig.pairs,
 				HostSetCount: hostSetCount,
-				// TotalCount will be filled in later by getCounts
+				Count:        0,
 			}
 
-			// Generate the CenQL query for this entry
 			entry.CenqlQuery = entry.ToCenqlQuery()
 			entry.SearchURL = entry.ToURL()
 
@@ -521,7 +489,6 @@ func (c *Censeye) findCommonAttributes(hostData map[string]gjson.Result) ([]*com
 		}
 	}
 
-	// Step 5: Sort by host set count (descending) to prioritize most common attributes
 	for i := 0; i < len(commonAttribs)-1; i++ {
 		for j := i + 1; j < len(commonAttribs); j++ {
 			if commonAttribs[i].HostSetCount < commonAttribs[j].HostSetCount {
