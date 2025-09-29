@@ -63,7 +63,6 @@ Flags:
   -C, --cache-duration duration   Duration to keep the cache (default: 23h) (default 168h0m0s)
   -c, --config string             Path to the configuration file
   -d, --depth int                 Depth of the scan (default: 0)
-  -f, --file string               File containing IP addresses (one per line or comma-separated)
   -h, --help                      help for censeye-ng
   -L, --log-level string          Log level (debug, info*, warn, error, fatal, panic)
       --no-color                  Disable colored output
@@ -101,25 +100,9 @@ Censeye-NG supports multiple input methods for analyzing common attributes acros
 
 **Direct arguments (handles spaces gracefully):**
 ```bash
+$ censeye-ng 1.2.3.4 5.6.7.8 9.10.11.12
 $ censeye-ng "1.2.3.4, 5.6.7.8, 9.10.11.12"
 $ censeye-ng 1.2.3.4,5.6.7.8,9.10.11.12
-```
-
-**File input (one IP per line or comma-separated):**
-```bash
-$ censeye-ng -f ips.txt
-$ censeye-ng --file ips.txt
-```
-
-Where `ips.txt` can contain:
-```
-1.2.3.4
-5.6.7.8
-9.10.11.12
-```
-or
-```
-1.2.3.4, 5.6.7.8, 9.10.11.12
 ```
 
 **Stdin input (original method):**
@@ -136,7 +119,7 @@ This helps identify distinctive characteristics shared across a cluster of hosts
 
 ```
 Common Attributes Analysis:
-🔗    Host_Set  Hosts    Key                    Val
+🔗    Set       Hosts    Key                    Val
       3         46       cert.issuer_dn         "C=Earth, ST=Cyberspace..."
       3         150000   protocol               "HTTP"
 ```

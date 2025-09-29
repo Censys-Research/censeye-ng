@@ -8,14 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/censys-research/censeye-ng/pkg/cache"
 	"github.com/censys-research/censeye-ng/pkg/config"
 	censys "github.com/censys/censys-sdk-go"
-	"github.com/censys/censys-sdk-go/models/components"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/sync/errgroup"
@@ -123,92 +121,6 @@ func WithAtTime(atTime *time.Time) RunOpt {
 // The return of which is a slice of Reports, each containing the results of the queries made.
 func (c *Censeye) Run(ctx context.Context, host string, opts ...RunOpt) ([]*Report, error) {
 	return c.run(ctx, host, opts...)
-}
-
-func (c *Censeye) RunMultiIP(ctx context.Context, hosts []string, opts ...RunOpt) ([]*Report, error) {
-	ro := &runOpts{}
-	for _, opt := range opts {
-		opt(ro)
-	}
-
-	if ro.state == nil {
-		ro.state = initRunState()
-	}
-
-	c.sendStatus(fmt.Sprintf("analyzing %d hosts for common attributes", len(hosts)))
-
-	hostData := make(map[string]gjson.Result)
-	totalCredits := 0
-
-	for _, host := range hosts {
-		c.sendStatus(fmt.Sprintf("fetching data for host: %s", host))
-
-		res, err := c.getHost(ctx, host, ro)
-		if err != nil {
-			log.Warnf("error getting host %s: %v", host, err)
-			continue
-		}
-		hostData[host] = res
-		totalCredits++
-	}
-
-	if len(hostData) == 0 {
-		return nil, fmt.Errorf("failed to fetch data for any hosts")
-	}
-
-	c.sendStatus("analyzing common attributes across hosts")
-
-	commonAttribs, err := c.findCommonAttributes(hostData)
-	if err != nil {
-		return nil, fmt.Errorf("error finding common attributes: %w", err)
-	}
-
-	if len(commonAttribs) == 0 {
-		log.Warn("no common attributes found across the provided hosts")
-		// Return empty report instead of error
-		report := &Report{
-			Host:    fmt.Sprintf("MultiIP-Analysis-%d-hosts", len(hosts)),
-			AtTime:  ro.atTime,
-			Credits: totalCredits,
-			Depth:   0,
-			Data:    []*reportEntry{},
-		}
-		return []*Report{report}, nil
-	}
-
-	c.sendStatus(fmt.Sprintf("getting global counts for %d common attributes", len(commonAttribs)))
-
-	rules := make([][]components.FieldValuePair, len(commonAttribs))
-	for i, attr := range commonAttribs {
-		rules[i] = attr.Pairs
-	}
-
-	countReport, err := c.getCounts(ctx, fmt.Sprintf("MultiIP-Analysis-%d-hosts", len(hosts)), rules)
-	if err != nil {
-		return nil, fmt.Errorf("error getting counts for common attributes: %w", err)
-	}
-
-	totalCredits += countReport.Credits
-
-	for i, entry := range countReport.Data {
-		if i < len(commonAttribs) {
-			commonAttribs[i].Count = entry.Count
-			commonAttribs[i].SearchURL = entry.SearchURL
-			commonAttribs[i].CenqlQuery = entry.CenqlQuery
-			commonAttribs[i].IsInteresting = entry.IsInteresting
-		}
-	}
-
-	report := &Report{
-		Host:    fmt.Sprintf("MultiIP-Analysis-%d-hosts", len(hosts)),
-		AtTime:  ro.atTime,
-		Credits: totalCredits,
-		Depth:   0,
-		Data:    commonAttribs,
-	}
-
-	c.sendStatus("multi-IP analysis complete")
-	return []*Report{report}, nil
 }
 
 // collectHosts will take a report and iterate over the entries of cenql queries. Those queries will then be run, and the
@@ -406,100 +318,6 @@ func (c *Censeye) run(ctx context.Context, startHost string, opts ...RunOpt) ([]
 	}
 
 	return reports, nil
-}
-
-func (c *Censeye) findCommonAttributes(hostData map[string]gjson.Result) ([]*reportEntry, error) {
-	hostRules := make(map[string][][]components.FieldValuePair)
-
-	for host, data := range hostData {
-		rules, err := c.compileRules(data)
-		if err != nil {
-			log.Warnf("error compiling rules for host %s: %v", host, err)
-			continue
-		}
-		hostRules[host] = rules
-	}
-
-	type ruleSignature struct {
-		pairs []components.FieldValuePair
-		hosts []string
-	}
-
-	ruleMap := make(map[string]*ruleSignature)
-
-	serializeRule := func(pairs []components.FieldValuePair) string {
-		if len(pairs) == 0 {
-			return ""
-		}
-
-		sorted := make([]components.FieldValuePair, len(pairs))
-		copy(sorted, pairs)
-
-		for i := 0; i < len(sorted)-1; i++ {
-			for j := i + 1; j < len(sorted); j++ {
-				if sorted[i].Field > sorted[j].Field ||
-					(sorted[i].Field == sorted[j].Field && sorted[i].Value > sorted[j].Value) {
-					sorted[i], sorted[j] = sorted[j], sorted[i]
-				}
-			}
-		}
-
-		parts := make([]string, len(sorted))
-		for i, pair := range sorted {
-			parts[i] = fmt.Sprintf("%s=%s", pair.Field, pair.Value)
-		}
-		return strings.Join(parts, "|")
-	}
-
-	for host, rules := range hostRules {
-		for _, rule := range rules {
-			sig := serializeRule(rule)
-			if sig == "" {
-				continue
-			}
-
-			if existing, exists := ruleMap[sig]; exists {
-				existing.hosts = append(existing.hosts, host)
-			} else {
-				ruleMap[sig] = &ruleSignature{
-					pairs: rule,
-					hosts: []string{host},
-				}
-			}
-		}
-	}
-
-	var commonAttribs []*reportEntry
-	totalHosts := len(hostData)
-
-	for _, ruleSig := range ruleMap {
-		hostSetCount := len(ruleSig.hosts)
-
-		if hostSetCount >= 2 {
-			entry := &reportEntry{
-				Pairs:        ruleSig.pairs,
-				HostSetCount: hostSetCount,
-				Count:        0,
-			}
-
-			entry.CenqlQuery = entry.ToCenqlQuery()
-			entry.SearchURL = entry.ToURL()
-
-			commonAttribs = append(commonAttribs, entry)
-		}
-	}
-
-	for i := 0; i < len(commonAttribs)-1; i++ {
-		for j := i + 1; j < len(commonAttribs); j++ {
-			if commonAttribs[i].HostSetCount < commonAttribs[j].HostSetCount {
-				commonAttribs[i], commonAttribs[j] = commonAttribs[j], commonAttribs[i]
-			}
-		}
-	}
-
-	log.Infof("found %d common attributes across %d hosts", len(commonAttribs), totalHosts)
-
-	return commonAttribs, nil
 }
 
 func (c *Censeye) runTask(

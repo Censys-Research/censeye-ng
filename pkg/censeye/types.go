@@ -53,15 +53,6 @@ type Report struct {
 	Data     []*reportEntry `json:"data"`
 }
 
-// MultiIPReport represents the results of analyzing multiple IPs for common attributes
-type MultiIPReport struct {
-	Hosts     []string       `json:"hosts"`
-	AtTime    *time.Time     `json:"at_time,omitempty"`
-	Credits   int            `json:"credits_used"`
-	Data      []*reportEntry `json:"data"`
-	HostCount int            `json:"host_count"`
-}
-
 // Referrer is a structure that holds information about how we arrived at the current report
 type Referrer struct {
 	Host string         `json:"host"`

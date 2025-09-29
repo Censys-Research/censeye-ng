@@ -42,7 +42,21 @@ var (
 	showConf        = false                       // show the configuration file in yaml format before running the command
 	pivotableFields []string                      // fields that should be considered for pivoting when depth > 1
 	aggMode         = false                       // enable aggregation mode for multi-IP common attribute analysis
+	reportOpts      []string
 )
+
+func initReportopts() {
+	if noColors {
+		reportOpts = append(reportOpts, "no-colors")
+	}
+	if noLinks {
+		reportOpts = append(reportOpts, "no-links")
+	} else {
+		// the api used to generate hyperlinks in the output doesn't seem to conver all
+		// supported terminals, so we default to forcing it on unless otherwise specified.
+		os.Setenv("FORCE_HYPERLINK", "true")
+	}
+}
 
 func report(w io.Writer, rep []*censeye.Report) {
 	type report struct {
@@ -50,23 +64,9 @@ func report(w io.Writer, rep []*censeye.Report) {
 		PivotTree []*censeye.PivotNode `json:"pivot_tree"`
 	}
 
-	var ropt []string
-
-	if noColors {
-		ropt = append(ropt, "no-colors")
-	}
-
-	if noLinks {
-		ropt = append(ropt, "no-links")
-	} else {
-		// the api used to generate hyperlinks in the output doesn't seem to conver all
-		// supported terminals, so we default to forcing it on unless otherwise specified.
-		os.Setenv("FORCE_HYPERLINK", "true")
-	}
-
 	switch outFormat {
 	case "pretty", "table":
-		r := censeye.NewReporter(w, ropt...)
+		r := censeye.NewReporter(w, reportOpts...)
 		r.Tables(rep)
 		r.Pivots(rep)
 		r.PivotTree(rep)
@@ -118,29 +118,6 @@ func parseIP(s string) string {
 	}
 
 	return strings.TrimSpace(s)
-}
-
-func parseIPList(input string) []string {
-	var ips []string
-
-	lines := strings.Split(input, "\n")
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		parts := strings.Split(line, ",")
-		for _, part := range parts {
-			cleanIP := parseIP(part)
-			if cleanIP != "" {
-				ips = append(ips, cleanIP)
-			}
-		}
-	}
-
-	return ips
 }
 
 func runCenseye(cmd *cobra.Command, args []string) {
@@ -228,105 +205,79 @@ func runCenseye(cmd *cobra.Command, args []string) {
 		return opts
 	}
 
-	var allIPs []string
+	allReports := []*censeye.Report{}
+
+	runhost := func(in string) {
+		if in == "" {
+			return
+		}
+
+		toprocess := []string{}
+
+		if strings.Contains(in, ",") {
+			parts := strings.Split(in, ",")
+			for p := range parts {
+				toprocess = append(toprocess, parseIP(parts[p]))
+			}
+		} else {
+			toprocess = append(toprocess, parseIP(in))
+		}
+
+		for p := range toprocess {
+			if toprocess[p] == "" {
+				continue
+			}
+
+			log.Infof("processing host: %s", toprocess[p])
+			res, err := ce.Run(ctx, toprocess[p], buildOpts()...)
+			stopSpinner()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error running censeye for %s: %v\n", toprocess[p], err)
+				continue
+			}
+			report(os.Stdout, res)
+
+			allReports = append(allReports, res...)
+		}
+	}
+
+	if len(args) == 0 {
+		if depth > 0 {
+			log.Fatalf("depth cannot be set when reading from stdin")
+		}
+
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			runhost(scanner.Text())
+		}
+	} else {
+		if depth > 0 && len(args) > 1 {
+			log.Fatalf("depth cannot be set when processing multiple hosts")
+		}
+
+		for _, arg := range args {
+			runhost(arg)
+		}
+	}
 
 	if aggMode {
-		if len(args) > 0 {
-			if len(args) == 1 && strings.Contains(args[0], ",") {
-				allIPs = parseIPList(args[0])
-			} else {
-				for _, arg := range args {
-					cleanIP := parseIP(arg)
-					if cleanIP != "" {
-						allIPs = append(allIPs, cleanIP)
-					}
-				}
-			}
-		} else {
-			scanner := bufio.NewScanner(os.Stdin)
-			var allInputs []string
-			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				if line != "" {
-					allInputs = append(allInputs, line)
-				}
+		r := censeye.NewReporter(os.Stdout, append(reportOpts, "aggregate")...)
+		switch outFormat {
+		case "pretty", "table":
+			r.Aggregate(allReports)
+		case "json":
+			agg := struct {
+				Aggregate any `json:"aggregate"`
+			}{
+				Aggregate: r.CreateAggregate(allReports),
 			}
 
-			if len(allInputs) == 0 {
-				log.Fatalf("no input provided")
-			}
-
-			allInput := strings.Join(allInputs, "\n")
-			allIPs = parseIPList(allInput)
-		}
-
-		if len(allIPs) == 0 {
-			log.Fatalf("no valid IP addresses found in input")
-		}
-
-		if depth > 0 {
-			log.Fatalf("depth cannot be set in --agg mode (unclear which common attributes to pivot on)")
-		}
-
-		log.Infof("processing %d hosts for common attribute analysis", len(allIPs))
-		res, err := ce.RunMultiIP(ctx, allIPs, buildOpts()...)
-		stopSpinner()
-
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error running multi-IP censeye: %v\n", err)
-			log.Fatalf("error running multi-IP censeye: %v", err)
-		}
-
-		report(os.Stdout, res)
-	} else {
-		if len(args) == 0 {
-			if depth > 0 {
-				log.Fatalf("depth cannot be set when reading from stdin")
-			}
-
-			scanner := bufio.NewScanner(os.Stdin)
-			for scanner.Scan() {
-				host := parseIP(scanner.Text())
-				if host == "" {
-					continue
-				}
-				log.Infof("processing host: %s", host)
-
-				res, err := ce.Run(ctx, host, buildOpts()...)
-				stopSpinner()
-
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "error running censeye for %s: %v\n", host, err)
-					continue
-				}
-
-				report(os.Stdout, res)
-			}
-		} else {
-			if len(args) > 1 {
-				log.Fatalf("multiple hosts provided - use --agg flag for multi-IP analysis")
-			}
-
-			if strings.Contains(args[0], ",") {
-				log.Fatalf("comma-separated IPs provided - use --agg flag for multi-IP analysis")
-			}
-
-			host := parseIP(args[0])
-			if host == "" {
-				log.Fatalf("invalid IP address: %s", args[0])
-			}
-
-			log.Infof("processing host: %s", host)
-
-			res, err := ce.Run(ctx, host, buildOpts()...)
-			stopSpinner()
-
+			j, err := json.Marshal(agg)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "error running censeye for %s: %v\n", host, err)
-				log.Fatalf("error running censeye: %v", err)
+				log.Errorf("error marshalling aggregate report to JSON: %v", err)
+				return
 			}
-
-			report(os.Stdout, res)
+			fmt.Fprintf(os.Stdout, "%s\n", j)
 		}
 	}
 
@@ -402,5 +353,5 @@ func init() {
 	rootCmd.Flags().BoolVar(&showConf, "showconf", showConf, "Show the configuration file in YAML format before running the command")
 	rootCmd.Flags().BoolVar(&aggMode, "agg", false, "Enable aggregation mode for multi-IP common attribute analysis")
 
-	cobra.OnInitialize(initLogging)
+	cobra.OnInitialize(initLogging, initReportopts)
 }
