@@ -24,6 +24,7 @@ type Reporter struct {
 	useLinks  bool
 	colors    TableColors
 	termWidth int
+	aggregate bool
 }
 
 // TableColors defines the color styles used in the reporter
@@ -76,6 +77,7 @@ func NewReporter(w io.Writer, args ...string) *Reporter {
 		useColor:  useColor,
 		useLinks:  useLinks,
 		termWidth: width,
+		aggregate: flags["aggregate"],
 		colors: TableColors{
 			Count:     st(color.FgDefault, false),
 			Key:       st(color.FgCyan, false),
@@ -99,23 +101,9 @@ func (r *Reporter) linkQuery(q string) string {
 		return q
 	}
 
-	qorig := q
-
-	if r.termWidth < 50 {
-		if len(q) > 20 {
-			return q[:20] + "..."
-		}
-		return q
-	}
-
-	maxLen := int(max(float64(r.termWidth-50), 0))
-	if len(q) > maxLen {
-		q = q[:maxLen] + "..."
-	}
-
 	return fmt.Sprintf("%s %s",
-		termlink.Link("⮺",
-			fmt.Sprintf("https://platform.censys.io/search?q=%s", url.QueryEscape(qorig))), q)
+		termlink.Link("→",
+			fmt.Sprintf("https://platform.censys.io/search?q=%s", url.QueryEscape(q))), q)
 }
 
 func (r *Reporter) colorize(entry *reportEntry, key, val, count string) (string, string, string) {
@@ -187,7 +175,7 @@ func (r *Reporter) formatViaQuery(query string) string {
 		viaColor := color.New(color.FgCyan)
 
 		// If there's a hyperlink, we need to be careful not to color the link symbol
-		if r.useLinks && strings.Contains(linked, "⮺") {
+		if r.useLinks && strings.Contains(linked, "→") {
 			// Split on the hyperlink symbol and colorize only the query part
 			parts := strings.SplitN(linked, " ", 2)
 			if len(parts) == 2 {
@@ -242,15 +230,22 @@ func (r *Reporter) buildTreeFromNodes(t treeprint.Tree, nodes []*PivotNode) {
 	}
 }
 
-// Tables generates and prints tables for multiple reports
-func (r *Reporter) Tables(reports []*Report) {
-	for _, report := range reports {
-		r.Table(report)
+func (r *Reporter) Aggregate(all []*Report) {
+	reports := r.CreateAggregate(all)
+
+	t := r.initTable()
+	t.AppendHeader(r.tableHeader())
+
+	_, valColWidth := r.maxWidths(reports.Sets)
+
+	for _, entry := range reports.Sets {
+		t.AppendRow(r.entryToRow(entry, valColWidth))
 	}
+
+	t.Render()
 }
 
-// Table generates a table for a single report using the configured color/hyperlink settings
-func (r *Reporter) Table(report *Report) {
+func (r *Reporter) initTable() table.Writer {
 	t := table.NewWriter()
 	t.SetStyle(table.Style{
 		Box: table.BoxStyle{
@@ -270,20 +265,33 @@ func (r *Reporter) Table(report *Report) {
 			SeparateRows:    false,
 		},
 	})
+
 	t.SetOutputMirror(r.w)
+	return t
+}
+
+func (r *Reporter) tableHeader() table.Row {
+	var header table.Row
 
 	if r.useLinks {
-		t.AppendHeader(table.Row{"🔗", "Hosts", "Key", "Val"})
-	} else {
-		t.AppendHeader(table.Row{"Hosts", "Key", "Val"})
+		header = append(header, "🔗")
 	}
 
-	wid := r.termWidth
-	t.AppendSeparator()
+	if r.aggregate {
+		header = append(header, "Set")
+	}
 
+	header = append(header, "Hosts", "Key", "Val")
+
+	return header
+}
+
+// maxWidths calculates optimal column widths based on the intput data
+func (r *Reporter) maxWidths(entries []*reportEntry) (keyColWidth, valColWidth int) {
 	hcol := 10
 	maxKeyLen := 0
-	for _, entry := range report.GetData() {
+
+	for _, entry := range entries {
 		key, _, _ := entry.ToCenqlShort()
 		key = strings.TrimPrefix(key, "host.services.")
 		key = strings.TrimPrefix(key, "endpoints.")
@@ -292,30 +300,92 @@ func (r *Reporter) Table(report *Report) {
 		}
 	}
 
-	keyColWidth := maxKeyLen + 4
-	valColWidth := wid - hcol - keyColWidth - 10
+	keyColWidth = maxKeyLen + 4
+	valColWidth = r.termWidth - hcol - keyColWidth - 10
 	valColWidth = max(valColWidth, 20)
 
-	for _, entry := range report.GetData() {
-		key, val, count := entry.ToCenqlShort()
-		key = strings.TrimPrefix(key, "host.services.")
-		key = strings.TrimPrefix(key, "endpoints.")
-		cfmt, key, val := r.colorize(entry, key, val, strconv.FormatInt(count, 10))
+	return keyColWidth, valColWidth
+}
 
-		if r.useLinks {
-			t.AppendRow(table.Row{
-				termlink.Link("⮺", entry.GetSearchURL()),
-				cfmt,
-				key,
-				text.WrapText(val, valColWidth),
-			})
-		} else {
-			t.AppendRow(table.Row{
-				cfmt,
-				key,
-				text.WrapText(val, valColWidth),
-			})
+type Aggregate struct {
+	Total int            `json:"total,omitempty"`
+	Sets  []*reportEntry `json:"sets,omitempty"`
+}
+
+func (r *Reporter) CreateAggregate(reports []*Report) *Aggregate {
+	agg := make(map[string]*reportEntry)
+	for _, report := range reports {
+		for _, ent := range report.Data {
+			if a, ok := agg[ent.CenqlQuery]; ok {
+				a.HostSetCount += 1
+			} else {
+				ent.HostSetCount = 1
+				agg[ent.CenqlQuery] = ent
+			}
 		}
+	}
+
+	ret := &Aggregate{
+		Total: len(reports),
+		Sets:  make([]*reportEntry, 0, len(agg)),
+	}
+
+	for _, val := range agg {
+		ret.Sets = append(ret.Sets, val)
+	}
+
+	sort.Slice(ret.Sets, func(i, j int) bool {
+		if ret.Sets[i].HostSetCount == ret.Sets[j].HostSetCount {
+			return ret.Sets[i].Count > ret.Sets[j].Count
+		}
+		return ret.Sets[i].HostSetCount > ret.Sets[j].HostSetCount
+	})
+
+	return ret
+}
+
+// entryToRow processes a single ReportEntry and returns a formatted table row
+func (r *Reporter) entryToRow(entry *reportEntry, valColWidth int) table.Row {
+	key, val, count := entry.ToCenqlShort()
+	key = strings.TrimPrefix(key, "host.services.")
+	key = strings.TrimPrefix(key, "endpoints.")
+	cfmt, key, val := r.colorize(entry, key, val, strconv.FormatInt(count, 10))
+
+	ret := table.Row{}
+
+	if r.useLinks {
+		ret = append(ret, termlink.Link("→", entry.GetSearchURL()))
+	}
+
+	if r.aggregate {
+		ret = append(ret, entry.HostSetCount)
+	}
+
+	ret = append(ret,
+		cfmt,
+		key,
+		text.WrapText(val, valColWidth),
+	)
+
+	return ret
+}
+
+// Tables generates and prints tables for multiple reports
+func (r *Reporter) Tables(reports []*Report) {
+	for _, report := range reports {
+		r.Table(report)
+	}
+}
+
+func (r *Reporter) Table(report *Report) {
+	t := r.initTable()
+	t.AppendHeader(r.tableHeader())
+	t.AppendSeparator()
+
+	_, valColWidth := r.maxWidths(report.GetData())
+
+	for _, entry := range report.GetData() {
+		t.AppendRow(r.entryToRow(entry, valColWidth))
 	}
 
 	host := report.GetHost()
@@ -490,11 +560,8 @@ func (r *Reporter) printPivot(p iPivot) {
 	query := p.cenqlQuery
 
 	if r.useLinks {
-		maxLen := r.termWidth - 30
-		if len(query) > maxLen {
-			query = query[:maxLen] + "..."
-		}
-		query = fmt.Sprintf("%s %s", termlink.Link("⮺", p.searchURL), query)
+		// Don't truncate by default - users want to see full queries
+		query = fmt.Sprintf("%s %s", termlink.Link("→", p.searchURL), query)
 	}
 
 	fmt.Fprintf(r.w, " - [%5d] %s\n", p.count, query)

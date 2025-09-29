@@ -21,7 +21,6 @@ import (
 
 const (
 	hostPfx    = "host"
-	webPfx     = "web"
 	defaultPfx = hostPfx
 )
 

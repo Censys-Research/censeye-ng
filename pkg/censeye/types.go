@@ -38,7 +38,6 @@ type runState struct {
 type runOpts struct {
 	depth  int
 	atTime *time.Time
-	via    *Referrer
 	state  *runState
 }
 
@@ -66,6 +65,8 @@ type reportEntry struct {
 	SearchURL     string                      `json:"search_url,omitempty"`
 	CenqlQuery    string                      `json:"cenql_query,omitempty"`
 	IsInteresting bool                        `json:"is_interesting"`
+	// For multi-IP reports: how many hosts in the input set have this attribute
+	HostSetCount int `json:"host_set_count,omitempty"`
 }
 
 func (r *Report) GetReferrer() *Referrer {
@@ -227,6 +228,13 @@ func (r *reportEntry) GetIsInteresting() bool {
 		return false
 	}
 	return r.IsInteresting
+}
+
+func (r *reportEntry) GetHostSetCount() int {
+	if r == nil {
+		return 0
+	}
+	return r.HostSetCount
 }
 
 // ToURL converts the report entry to a URL that can be used to search on Censys

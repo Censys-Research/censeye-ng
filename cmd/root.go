@@ -41,7 +41,22 @@ var (
 	atTime          string                        // fetch historical information from a specific host
 	showConf        = false                       // show the configuration file in yaml format before running the command
 	pivotableFields []string                      // fields that should be considered for pivoting when depth > 1
+	aggMode         = false                       // enable aggregation mode for multi-IP common attribute analysis
+	reportOpts      []string
 )
+
+func initReportopts() {
+	if noColors {
+		reportOpts = append(reportOpts, "no-colors")
+	}
+	if noLinks {
+		reportOpts = append(reportOpts, "no-links")
+	} else {
+		// the api used to generate hyperlinks in the output doesn't seem to conver all
+		// supported terminals, so we default to forcing it on unless otherwise specified.
+		os.Setenv("FORCE_HYPERLINK", "true")
+	}
+}
 
 func report(w io.Writer, rep []*censeye.Report) {
 	type report struct {
@@ -49,23 +64,9 @@ func report(w io.Writer, rep []*censeye.Report) {
 		PivotTree []*censeye.PivotNode `json:"pivot_tree"`
 	}
 
-	var ropt []string
-
-	if noColors {
-		ropt = append(ropt, "no-colors")
-	}
-
-	if noLinks {
-		ropt = append(ropt, "no-links")
-	} else {
-		// the api used to generate hyperlinks in the output doesn't seem to conver all
-		// supported terminals, so we default to forcing it on unless otherwise specified.
-		os.Setenv("FORCE_HYPERLINK", "true")
-	}
-
 	switch outFormat {
 	case "pretty", "table":
-		r := censeye.NewReporter(w, ropt...)
+		r := censeye.NewReporter(w, reportOpts...)
 		r.Tables(rep)
 		r.Pivots(rep)
 		r.PivotTree(rep)
@@ -204,42 +205,80 @@ func runCenseye(cmd *cobra.Command, args []string) {
 		return opts
 	}
 
+	allReports := []*censeye.Report{}
+
+	runhost := func(in string) {
+		if in == "" {
+			return
+		}
+
+		toprocess := []string{}
+
+		if strings.Contains(in, ",") {
+			parts := strings.Split(in, ",")
+			for p := range parts {
+				toprocess = append(toprocess, parseIP(parts[p]))
+			}
+		} else {
+			toprocess = append(toprocess, parseIP(in))
+		}
+
+		for p := range toprocess {
+			if toprocess[p] == "" {
+				continue
+			}
+
+			log.Infof("processing host: %s", toprocess[p])
+			res, err := ce.Run(ctx, toprocess[p], buildOpts()...)
+			stopSpinner()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error running censeye for %s: %v\n", toprocess[p], err)
+				continue
+			}
+			report(os.Stdout, res)
+
+			allReports = append(allReports, res...)
+		}
+	}
+
 	if len(args) == 0 {
 		if depth > 0 {
-			// i mean, technically we could do this, but it's really annoying to understand
-			// but i can be convinced otherwise.
 			log.Fatalf("depth cannot be set when reading from stdin")
 		}
 
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
-			host := parseIP(scanner.Text())
-			if host == "" {
-				continue
-			}
-			log.Infof("processing host: %s", host)
-
-			res, err := ce.Run(ctx, host, buildOpts()...)
-			stopSpinner()
-
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error running censeye for %s: %v\n", host, err)
-				continue
-			}
-
-			report(os.Stdout, res)
+			runhost(scanner.Text())
 		}
 	} else {
-		host := parseIP(args[0])
-		res, err := ce.Run(ctx, host, buildOpts()...)
-		stopSpinner()
-
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error running censeye: %v\n", err)
-			log.Fatalf("error running censeye: %v", err)
+		if depth > 0 && len(args) > 1 {
+			log.Fatalf("depth cannot be set when processing multiple hosts")
 		}
 
-		report(os.Stdout, res)
+		for _, arg := range args {
+			runhost(arg)
+		}
+	}
+
+	if aggMode {
+		r := censeye.NewReporter(os.Stdout, append(reportOpts, "aggregate")...)
+		switch outFormat {
+		case "pretty", "table":
+			r.Aggregate(allReports)
+		case "json":
+			agg := struct {
+				Aggregate any `json:"aggregate"`
+			}{
+				Aggregate: r.CreateAggregate(allReports),
+			}
+
+			j, err := json.Marshal(agg)
+			if err != nil {
+				log.Errorf("error marshalling aggregate report to JSON: %v", err)
+				return
+			}
+			fmt.Fprintf(os.Stdout, "%s\n", j)
+		}
 	}
 
 	fmt.Fprintln(os.Stderr, "Censys credits used: ", ce.GetCredits())
@@ -312,6 +351,7 @@ func init() {
 	rootCmd.Flags().StringVarP(&atTime, "at", "a", "", "Fetch host data from a specific date (e.g., '2023-10-01 12:00:00')")
 	rootCmd.Flags().StringVar(&atTime, "at-time", "", "alias for --at")
 	rootCmd.Flags().BoolVar(&showConf, "showconf", showConf, "Show the configuration file in YAML format before running the command")
+	rootCmd.Flags().BoolVar(&aggMode, "agg", false, "Enable aggregation mode for multi-IP common attribute analysis")
 
-	cobra.OnInitialize(initLogging)
+	cobra.OnInitialize(initLogging, initReportopts)
 }
