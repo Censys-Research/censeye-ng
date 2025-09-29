@@ -24,6 +24,7 @@ type Reporter struct {
 	useLinks  bool
 	colors    TableColors
 	termWidth int
+	aggregate bool
 }
 
 // TableColors defines the color styles used in the reporter
@@ -76,6 +77,7 @@ func NewReporter(w io.Writer, args ...string) *Reporter {
 		useColor:  useColor,
 		useLinks:  useLinks,
 		termWidth: width,
+		aggregate: flags["aggregate"],
 		colors: TableColors{
 			Count:     st(color.FgDefault, false),
 			Key:       st(color.FgCyan, false),
@@ -228,15 +230,22 @@ func (r *Reporter) buildTreeFromNodes(t treeprint.Tree, nodes []*PivotNode) {
 	}
 }
 
-// Tables generates and prints tables for multiple reports
-func (r *Reporter) Tables(reports []*Report) {
-	for _, report := range reports {
-		r.Table(report)
+func (r *Reporter) Aggregate(all []*Report) {
+	reports := r.CreateAggregate(all)
+
+	t := r.initTable()
+	t.AppendHeader(r.tableHeader())
+
+	_, valColWidth := r.maxWidths(reports.Sets)
+
+	for _, entry := range reports.Sets {
+		t.AppendRow(r.entryToRow(entry, valColWidth))
 	}
+
+	t.Render()
 }
 
-// Table generates a table for a single report using the configured color/hyperlink settings
-func (r *Reporter) Table(report *Report) {
+func (r *Reporter) initTable() table.Writer {
 	t := table.NewWriter()
 	t.SetStyle(table.Style{
 		Box: table.BoxStyle{
@@ -256,33 +265,33 @@ func (r *Reporter) Table(report *Report) {
 			SeparateRows:    false,
 		},
 	})
+
 	t.SetOutputMirror(r.w)
+	return t
+}
 
-	// Check if this is a multi-IP analysis report
-	isMultiIP := strings.HasPrefix(report.Host, "MultiIP-Analysis-")
+func (r *Reporter) tableHeader() table.Row {
+	var header table.Row
 
-	if isMultiIP {
-		// Multi-IP report format with host_set column
-		if r.useLinks {
-			t.AppendHeader(table.Row{"→", "Host_Set", "Hosts", "Key", "Val"})
-		} else {
-			t.AppendHeader(table.Row{"Host_Set", "Hosts", "Key", "Val"})
-		}
-	} else {
-		// Standard single-IP report format
-		if r.useLinks {
-			t.AppendHeader(table.Row{"→", "Hosts", "Key", "Val"})
-		} else {
-			t.AppendHeader(table.Row{"Hosts", "Key", "Val"})
-		}
+	if r.useLinks {
+		header = append(header, "🔗")
 	}
 
-	wid := r.termWidth
-	t.AppendSeparator()
+	if r.aggregate {
+		header = append(header, "Set")
+	}
 
+	header = append(header, "Hosts", "Key", "Val")
+
+	return header
+}
+
+// maxWidths calculates optimal column widths based on the intput data
+func (r *Reporter) maxWidths(entries []*reportEntry) (keyColWidth, valColWidth int) {
 	hcol := 10
 	maxKeyLen := 0
-	for _, entry := range report.GetData() {
+
+	for _, entry := range entries {
 		key, _, _ := entry.ToCenqlShort()
 		key = strings.TrimPrefix(key, "host.services.")
 		key = strings.TrimPrefix(key, "endpoints.")
@@ -291,55 +300,92 @@ func (r *Reporter) Table(report *Report) {
 		}
 	}
 
-	keyColWidth := maxKeyLen + 4
-	valColWidth := wid - hcol - keyColWidth - 10
+	keyColWidth = maxKeyLen + 4
+	valColWidth = r.termWidth - hcol - keyColWidth - 10
 	valColWidth = max(valColWidth, 20)
 
-	for _, entry := range report.GetData() {
-		key, val, count := entry.ToCenqlShort()
-		key = strings.TrimPrefix(key, "host.services.")
-		key = strings.TrimPrefix(key, "endpoints.")
+	return keyColWidth, valColWidth
+}
 
-		if isMultiIP {
-			// For multi-IP reports, use the HostSetCount from the entry
-			hostSetCount := strconv.Itoa(entry.GetHostSetCount())
-			cfmt, key, val := r.colorize(entry, key, val, strconv.FormatInt(count, 10))
+type Aggregate struct {
+	Total int            `json:"total,omitempty"`
+	Sets  []*reportEntry `json:"sets,omitempty"`
+}
 
-			if r.useLinks {
-				t.AppendRow(table.Row{
-					termlink.Link("→", entry.GetSearchURL()),
-					hostSetCount, // Host_Set column
-					cfmt,         // Hosts column (total in Censys)
-					key,
-					text.WrapText(val, valColWidth),
-				})
+func (r *Reporter) CreateAggregate(reports []*Report) *Aggregate {
+	agg := make(map[string]*reportEntry)
+	for _, report := range reports {
+		for _, ent := range report.Data {
+			if a, ok := agg[ent.CenqlQuery]; ok {
+				a.HostSetCount += 1
 			} else {
-				t.AppendRow(table.Row{
-					hostSetCount, // Host_Set column
-					cfmt,         // Hosts column (total in Censys)
-					key,
-					text.WrapText(val, valColWidth),
-				})
-			}
-		} else {
-			// Standard single-IP report format
-			cfmt, key, val := r.colorize(entry, key, val, strconv.FormatInt(count, 10))
-
-			if r.useLinks {
-				t.AppendRow(table.Row{
-					termlink.Link("→", entry.GetSearchURL()),
-					cfmt,
-					key,
-					text.WrapText(val, valColWidth),
-				})
-			} else {
-				t.AppendRow(table.Row{
-					cfmt,
-					key,
-					text.WrapText(val, valColWidth),
-				})
+				ent.HostSetCount = 1
+				agg[ent.CenqlQuery] = ent
 			}
 		}
+	}
+
+	ret := &Aggregate{
+		Total: len(reports),
+		Sets:  make([]*reportEntry, 0, len(agg)),
+	}
+
+	for _, val := range agg {
+		ret.Sets = append(ret.Sets, val)
+	}
+
+	sort.Slice(ret.Sets, func(i, j int) bool {
+		if ret.Sets[i].HostSetCount == ret.Sets[j].HostSetCount {
+			return ret.Sets[i].Count > ret.Sets[j].Count
+		}
+		return ret.Sets[i].HostSetCount > ret.Sets[j].HostSetCount
+	})
+
+	return ret
+}
+
+// entryToRow processes a single ReportEntry and returns a formatted table row
+func (r *Reporter) entryToRow(entry *reportEntry, valColWidth int) table.Row {
+	key, val, count := entry.ToCenqlShort()
+	key = strings.TrimPrefix(key, "host.services.")
+	key = strings.TrimPrefix(key, "endpoints.")
+	cfmt, key, val := r.colorize(entry, key, val, strconv.FormatInt(count, 10))
+
+	ret := table.Row{}
+
+	if r.useLinks {
+		ret = append(ret, termlink.Link("→", entry.GetSearchURL()))
+	}
+
+	if r.aggregate {
+		ret = append(ret, entry.HostSetCount)
+	}
+
+	ret = append(ret,
+		cfmt,
+		key,
+		text.WrapText(val, valColWidth),
+	)
+
+	return ret
+}
+
+// Tables generates and prints tables for multiple reports
+func (r *Reporter) Tables(reports []*Report) {
+	for _, report := range reports {
+		r.Table(report)
+	}
+}
+
+func (r *Reporter) Table(report *Report) {
+	t := r.initTable()
+	t.AppendHeader(r.tableHeader())
+	t.AppendSeparator()
+
+	_, valColWidth := r.maxWidths(report.GetData())
+
+	for _, entry := range report.GetData() {
+		t.AppendRow(r.entryToRow(entry, valColWidth))
 	}
 
 	host := report.GetHost()
@@ -364,21 +410,14 @@ func (r *Reporter) Table(report *Report) {
 		allVia += viaEntry.GetCenqlQuery() + ", "
 	}
 
-	if isMultiIP {
-		// Multi-IP analysis header
-		fmt.Fprintf(r.w, "\n%s\n", report.Host)
-		fmt.Fprintln(r.w, "Common Attributes Analysis:")
-	} else {
-		// Standard single-IP header
-		hostWithTags := r.formatHostWithTags(host, report.Labels, report.Threats)
-		fmt.Fprintf(r.w, "\n%s (depth: %d) (via: %s -- %s)\n", hostWithTags, report.GetDepth(), viah, via)
+	hostWithTags := r.formatHostWithTags(host, report.Labels, report.Threats)
+	fmt.Fprintf(r.w, "\n%s (depth: %d) (via: %s -- %s)\n", hostWithTags, report.GetDepth(), viah, via)
 
-		if report.GetReferrer() != nil {
-			fmt.Fprintf(r.w, "Parent IP: %s\n", r.linkHost(viah))
-			fmt.Fprintln(r.w, "All matching queries:")
-			for _, viaEntry := range report.GetReferrer().GetAllVia() {
-				fmt.Fprintf(r.w, " - %s\n", r.formatViaQuery(viaEntry.GetCenqlQuery()))
-			}
+	if report.GetReferrer() != nil {
+		fmt.Fprintf(r.w, "Parent IP: %s\n", r.linkHost(viah))
+		fmt.Fprintln(r.w, "All matching queries:")
+		for _, viaEntry := range report.GetReferrer().GetAllVia() {
+			fmt.Fprintf(r.w, " - %s\n", r.formatViaQuery(viaEntry.GetCenqlQuery()))
 		}
 	}
 
