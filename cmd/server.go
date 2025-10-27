@@ -86,7 +86,16 @@ func handleConn(ctx context.Context, ce *censeye.Censeye) http.HandlerFunc {
 				continue
 			}
 
-			j, err := json.Marshal(res)
+			type report struct {
+				Reports   []*censeye.Report    `json:"reports"`
+				PivotTree []*censeye.PivotNode `json:"pivot_tree,omitempty"`
+			}
+
+			r := &censeye.Reporter{}
+			j, err := json.Marshal(
+				report{Reports: res,
+					PivotTree: r.CreatePivotTree(res),
+				})
 			if err != nil {
 				log.Errorf("Failed to marshal result: %v", err)
 				continue
