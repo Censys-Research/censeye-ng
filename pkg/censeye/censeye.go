@@ -183,7 +183,11 @@ func (c *Censeye) collectHosts(ctx context.Context, viahost string, rep *Report,
 					existingRef.Via = append(existingRef.Via, entry)
 				} else {
 					// new host, create new referrer with this query
-					res[h] = &Referrer{viahost, []*reportEntry{entry}}
+					res[h] = &Referrer{
+						Host:   viahost,
+						Via:    []*reportEntry{entry},
+						AtTime: nil,
+					}
 				}
 			}
 			ro.state.Unlock()
@@ -201,7 +205,22 @@ func (c *Censeye) runPivots(
 	task runTask,
 	ro *runOpts,
 ) ([]*Report, map[string]*Referrer, error) {
-	res, err := c.getHost(ctx, task.host, ro)
+	// Check if this task has a specific at_time from certificate history
+	taskAtTime := ro.atTime
+	if task.ref != nil && task.ref.AtTime != nil {
+		taskAtTime = task.ref.AtTime
+		logForHost(task.host).Infof("Using certificate history at_time: %s", taskAtTime.Format(time.RFC3339Nano))
+	}
+
+	// Create a temporary runOpts with the task-specific at_time
+	taskRo := &runOpts{
+		depth:  ro.depth,
+		atTime: taskAtTime,
+		via:    ro.via,
+		state:  ro.state,
+	}
+
+	res, err := c.getHost(ctx, task.host, taskRo)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -230,13 +249,76 @@ func (c *Censeye) runPivots(
 	report.Depth = task.depth
 	report.Referrer = task.ref
 	report.Labels = task.labels
-	report.AtTime = ro.atTime
+	report.AtTime = taskAtTime
 	report.Threats = task.threats
 	reports := []*Report{report}
 
 	var next map[string]*Referrer
 	if task.depth < ro.depth {
 		next = c.collectHosts(ctx, task.host, report, ro)
+
+		// Add certificate history pivots if any
+		if len(report.CertHistoryPivots) > 0 {
+			if next == nil {
+				next = make(map[string]*Referrer)
+			}
+
+			// Group IPs by certificate fingerprint for better labeling
+			certToIPs := make(map[string]map[string]*time.Time)
+			for _, entry := range report.Data {
+				if len(entry.HistoricalObservations) > 0 {
+					// Get the certificate fingerprint from the entry
+					for _, pair := range entry.Pairs {
+						if pair.GetField() == "host.services.cert.fingerprint_sha256" {
+							certFp := pair.GetValue()
+							if certToIPs[certFp] == nil {
+								certToIPs[certFp] = make(map[string]*time.Time)
+							}
+							// Map this cert's IPs
+							for ip, atTime := range report.CertHistoryPivots {
+								certToIPs[certFp][ip] = atTime
+							}
+							break
+						}
+					}
+				}
+			}
+
+			// Create entries for each certificate
+			for certFp, ips := range certToIPs {
+				// Create a synthetic report entry for this certificate's history
+				certHistEntry := &reportEntry{
+					CenqlQuery:    fmt.Sprintf("certificate_history (cert: %s)", certFp),
+					SearchURL:     "",
+					IsInteresting: true,
+				}
+
+				for ip, atTime := range ips {
+					ro.state.Lock()
+					if !ro.state.hostsChecked[ip] {
+						// Add this IP to the pivot queue with its specific at_time
+						if existingRef := next[ip]; existingRef != nil {
+							// Host already found by another query, append certificate history entry
+							existingRef.Via = append(existingRef.Via, certHistEntry)
+							// Don't override existing AtTime if already set
+							if existingRef.AtTime == nil {
+								existingRef.AtTime = atTime
+							}
+						} else {
+							// New host from certificate history with specific at_time
+							next[ip] = &Referrer{
+								Host:   task.host,
+								Via:    []*reportEntry{certHistEntry},
+								AtTime: atTime,
+							}
+						}
+
+						logForHost(task.host).Infof("Adding certificate history pivot: %s at %s (cert: %s)", ip, atTime.Format(time.RFC3339Nano), certFp)
+					}
+					ro.state.Unlock()
+				}
+			}
+		}
 	}
 
 	ro.state.Lock() // technically safe without, but just in case for future...

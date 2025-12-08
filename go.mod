@@ -4,8 +4,9 @@ go 1.24.2
 
 require (
 	github.com/briandowns/spinner v1.23.2
-	github.com/censys/censys-sdk-go v0.18.4
+	github.com/censys/censys-sdk-go v0.24.0
 	github.com/gookit/color v1.5.4
+	github.com/gorilla/websocket v1.5.3
 	github.com/jedib0t/go-pretty/v6 v6.6.7
 	github.com/savioxavier/termlink v1.4.3
 	github.com/sirupsen/logrus v1.9.3
@@ -18,9 +19,7 @@ require (
 )
 
 require (
-	github.com/ericlagergren/decimal v0.0.0-20221120152707-495c53812d05 // indirect
 	github.com/fatih/color v1.7.0 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mattn/go-colorable v0.1.2 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

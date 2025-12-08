@@ -8,7 +8,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/censys/censys-sdk-go/models/components"
 	"github.com/gookit/color"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
@@ -88,9 +90,19 @@ func NewReporter(w io.Writer, args ...string) *Reporter {
 }
 
 func (r *Reporter) linkHost(ip string) string {
+	return r.linkHostWithTime(ip, nil)
+}
+
+func (r *Reporter) linkHostWithTime(ip string, atTime *time.Time) string {
 	if !r.useLinks {
 		return ip
 	}
+
+	if atTime != nil {
+		return termlink.Link(ip, fmt.Sprintf("https://platform.censys.io/hosts/%s?at_time=%s",
+			url.QueryEscape(ip), url.QueryEscape(atTime.Format(time.RFC3339Nano))))
+	}
+
 	return termlink.Link(ip, fmt.Sprintf("https://platform.censys.io/hosts/%s", url.QueryEscape(ip)))
 }
 
@@ -211,9 +223,16 @@ func (r *Reporter) PivotTree(reports []*Report) {
 	fmt.Fprintln(r.w, "\nPivot Tree:")
 	for _, root := range pivotNodes {
 		tree := treeprint.New()
-		host := r.linkHost(root.IP)
+		host := r.linkHostWithTime(root.IP, root.AtTime)
 		hostWithTags := r.formatHostWithTags(host, root.Labels, root.Threats)
-		tree.SetValue(fmt.Sprintf("%s (depth %d)", hostWithTags, root.Depth))
+
+		// Add at_time display if present
+		rootLabel := fmt.Sprintf("%s (depth %d)", hostWithTags, root.Depth)
+		if root.AtTime != nil {
+			rootLabel = fmt.Sprintf("%s @ %s (depth %d)", hostWithTags, root.AtTime.Format(time.RFC3339), root.Depth)
+		}
+
+		tree.SetValue(rootLabel)
 
 		r.buildTreeFromNodes(tree, root.Children)
 		fmt.Fprintln(r.w, tree.String())
@@ -233,9 +252,15 @@ func (r *Reporter) buildTreeFromNodes(t treeprint.Tree, nodes []*PivotNode) {
 			viaBranch := t.AddBranch(label)
 			r.buildTreeFromNodes(viaBranch, node.Children)
 		} else {
-			// This is an IP node
-			host := r.linkHost(node.IP)
+			// This is an IP node with optional at_time
+			host := r.linkHostWithTime(node.IP, node.AtTime)
 			hostWithTags := r.formatHostWithTags(host, node.Labels, node.Threats)
+
+			// Add at_time display if present
+			if node.AtTime != nil {
+				hostWithTags = fmt.Sprintf("%s @ %s", hostWithTags, node.AtTime.Format(time.RFC3339))
+			}
+
 			branch := t.AddBranch(hostWithTags)
 			r.buildTreeFromNodes(branch, node.Children)
 		}
@@ -326,12 +351,12 @@ func (r *Reporter) Table(report *Report) {
 
 	if r.useLinks {
 		via = termlink.Link(viaq, vial)
-		viah = termlink.Link(viah, fmt.Sprintf("https://platform.censys.io/hosts/%s", url.QueryEscape(viah)))
-		if report.AtTime != nil {
-			host = termlink.Link(host, fmt.Sprintf("https://platform.censys.io/hosts/%s?at_time=%s", url.QueryEscape(host), report.AtTime.Format("2006-01-02T15:04:05Z")))
-		} else {
-			host = termlink.Link(host, fmt.Sprintf("https://platform.censys.io/hosts/%s", url.QueryEscape(host)))
-		}
+
+		// Link parent host (no at_time for parent)
+		viah = r.linkHost(viah)
+
+		// Link current host with its at_time if present
+		host = r.linkHostWithTime(host, report.AtTime)
 	}
 
 	var allVia string
@@ -341,10 +366,17 @@ func (r *Reporter) Table(report *Report) {
 	}
 
 	hostWithTags := r.formatHostWithTags(host, report.Labels, report.Threats)
-	fmt.Fprintf(r.w, "\n%s (depth: %d) (via: %s -- %s)\n", hostWithTags, report.GetDepth(), viah, via)
+
+	// Add at_time to the header if present
+	atTimeStr := ""
+	if report.AtTime != nil {
+		atTimeStr = fmt.Sprintf(" at_time=%s", report.AtTime.Format(time.RFC3339Nano))
+	}
+
+	fmt.Fprintf(r.w, "\n%s (depth: %d) (via: %s -- %s)%s\n", hostWithTags, report.GetDepth(), viah, via, atTimeStr)
 
 	if report.GetReferrer() != nil {
-		fmt.Fprintf(r.w, "Parent IP: %s\n", r.linkHost(viah))
+		fmt.Fprintf(r.w, "Parent IP: %s\n", viah)
 		fmt.Fprintln(r.w, "All matching queries:")
 		for _, viaEntry := range report.GetReferrer().GetAllVia() {
 			fmt.Fprintf(r.w, " - %s\n", r.formatViaQuery(viaEntry.GetCenqlQuery()))
@@ -352,6 +384,119 @@ func (r *Reporter) Table(report *Report) {
 	}
 
 	t.Render()
+
+	// Display historical certificate observations if any
+	r.HistoricalCertificateObservations(report)
+}
+
+// HistoricalCertificateObservations displays historical certificate observations in a tree format
+func (r *Reporter) HistoricalCertificateObservations(report *Report) {
+	// Collect all historical observations from the report
+	histObs := make(map[string][]components.HostObservationRange)
+
+	for _, entry := range report.GetData() {
+		if len(entry.HistoricalObservations) > 0 {
+			// Create a key like "host.services.cert.fingerprint_sha256=abc123"
+			key, val, _ := entry.ToCenql()
+			if !strings.HasPrefix(val, "(") {
+				histKey := fmt.Sprintf("%s=%s", key, val)
+				histObs[histKey] = entry.HistoricalObservations
+			}
+		}
+	}
+
+	if len(histObs) == 0 {
+		return
+	}
+
+	// First pass: filter certificates to only those with valid observations
+	validHistObs := make(map[string]map[string][]string) // certKey -> ipToTimes
+
+	for certKey, observations := range histObs {
+		ipToTimes := make(map[string][]string)
+
+		for _, obs := range observations {
+			ip := obs.GetIP()
+			if ip == "" {
+				continue
+			}
+
+			// Skip if this is the current host we're analyzing
+			if ip == report.GetHost() {
+				continue
+			}
+
+			// Collect timestamps for this IP
+			startTime := obs.GetStartTime()
+			endTime := obs.GetEndTime()
+
+			// Format timestamps to RFC3339Nano (e.g., 2025-11-11T11:22:29.622899241Z)
+			var startStr, endStr string
+
+			if !startTime.IsZero() {
+				startStr = startTime.Format(time.RFC3339Nano)
+			}
+
+			if !endTime.IsZero() {
+				endStr = endTime.Format(time.RFC3339Nano)
+			}
+
+			if startStr != "" {
+				ipToTimes[ip] = append(ipToTimes[ip], startStr)
+			}
+			if endStr != "" && endStr != startStr {
+				ipToTimes[ip] = append(ipToTimes[ip], endStr)
+			}
+		}
+
+		// Only include this certificate if it has observations from other hosts
+		if len(ipToTimes) > 0 {
+			validHistObs[certKey] = ipToTimes
+		}
+	}
+
+	// If no valid observations after filtering, don't print anything
+	if len(validHistObs) == 0 {
+		return
+	}
+
+	fmt.Fprintf(r.w, "\nHistorical Certificate Observations: %d\n", len(validHistObs))
+
+	for certKey, ipToTimes := range validHistObs {
+		tree := treeprint.New()
+		tree.SetValue(certKey)
+
+		// Sort IPs for consistent output
+		ips := make([]string, 0, len(ipToTimes))
+		for ip := range ipToTimes {
+			ips = append(ips, ip)
+		}
+		sort.Strings(ips)
+
+		// Add each IP with its median observation timestamp
+		for _, ip := range ips {
+			times := ipToTimes[ip]
+
+			// Sort times to get median
+			sort.Strings(times)
+
+			// Get the median timestamp
+			medianIdx := len(times) / 2
+			medianTime := times[medianIdx]
+
+			var display string
+			if r.useLinks {
+				link := fmt.Sprintf("https://platform.censys.io/hosts/%s?at_time=%s",
+					url.QueryEscape(ip), url.QueryEscape(medianTime))
+				display = fmt.Sprintf("%s: %s (%d observations)", medianTime, termlink.Link(ip, link), len(times))
+			} else {
+				display = fmt.Sprintf("%s: %s (%d observations)", medianTime, ip, len(times))
+			}
+			tree.AddNode(display)
+		}
+
+		fmt.Fprintln(r.w, tree.String())
+	}
 }
 
 // PivotNode represents a node in the pivot tree structure
@@ -359,6 +504,7 @@ type PivotNode struct {
 	IP       string       `json:"ip,omitempty"`
 	Depth    int          `json:"depth,omitempty"`
 	Via      string       `json:"via,omitempty"`
+	AtTime   *time.Time   `json:"at_time,omitempty"`
 	Labels   []string     `json:"labels,omitempty"`
 	Threats  []string     `json:"threats,omitempty"`
 	Children []*PivotNode `json:"children,omitempty"`
@@ -375,6 +521,7 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 		depth   int
 		via     string
 		parent  string
+		atTime  *time.Time
 		labels  []string
 		threats []string
 	}
@@ -398,6 +545,7 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 			depth:   depth,
 			via:     via,
 			parent:  parent,
+			atTime:  rep.AtTime,
 			labels:  rep.Labels,
 			threats: rep.Threats,
 		}
@@ -434,6 +582,7 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 				ipNodes = append(ipNodes, &PivotNode{
 					IP:       child.ip,
 					Depth:    child.depth,
+					AtTime:   child.atTime,
 					Labels:   child.labels,
 					Threats:  child.threats,
 					Children: build(child.ip),
@@ -458,6 +607,7 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 				groupChildren = append(groupChildren, &PivotNode{
 					IP:       child.ip,
 					Depth:    child.depth,
+					AtTime:   child.atTime,
 					Labels:   child.labels,
 					Threats:  child.threats,
 					Children: build(child.ip),
@@ -477,6 +627,7 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 		jsonRoots = append(jsonRoots, &PivotNode{
 			IP:       root.ip,
 			Depth:    root.depth,
+			AtTime:   root.atTime,
 			Labels:   root.labels,
 			Threats:  root.threats,
 			Children: build(root.ip),
@@ -534,7 +685,7 @@ func (r *Reporter) Pivots(reps []*Report) {
 			return pivots[i].count > pivots[j].count
 		})
 
-		fmt.Fprintln(r.w, "\nInteresting pivots:")
+		fmt.Fprintln(r.w, "Interesting pivots:")
 		for _, p := range pivots {
 			r.printPivot(p)
 		}

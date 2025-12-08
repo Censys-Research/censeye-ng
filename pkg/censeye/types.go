@@ -44,28 +44,31 @@ type runOpts struct {
 
 // Report is the public report structure that holds the results of a Censeye run.
 type Report struct {
-	Host     string         `json:"host"`
-	AtTime   *time.Time     `json:"at_time,omitempty"`
-	Credits  int            `json:"credits_used"`
-	Referrer *Referrer      `json:"referrer,omitempty"`
-	Depth    int            `json:"depth"`
-	Labels   []string       `json:"labels"`
-	Threats  []string       `json:"threats"`
-	Data     []*reportEntry `json:"data"`
+	Host              string                `json:"host"`
+	AtTime            *time.Time            `json:"at_time,omitempty"`
+	Credits           int                   `json:"credits_used"`
+	Referrer          *Referrer             `json:"referrer,omitempty"`
+	Depth             int                   `json:"depth"`
+	Labels            []string              `json:"labels"`
+	Threats           []string              `json:"threats"`
+	Data              []*reportEntry        `json:"data"`
+	CertHistoryPivots map[string]*time.Time `json:"-"` // IP -> median at_time for certificate history pivots
 }
 
 // Referrer is a structure that holds information about how we arrived at the current report
 type Referrer struct {
-	Host string         `json:"host"`
-	Via  []*reportEntry `json:"via"`
+	Host   string         `json:"host"`
+	Via    []*reportEntry `json:"via"`
+	AtTime *time.Time     `json:"at_time,omitempty"` // Optional at_time for certificate history pivots
 }
 
 type reportEntry struct {
-	Pairs         []components.FieldValuePair `json:"kv_pairs"`
-	Count         int64                       `json:"count"`
-	SearchURL     string                      `json:"search_url,omitempty"`
-	CenqlQuery    string                      `json:"cenql_query,omitempty"`
-	IsInteresting bool                        `json:"is_interesting"`
+	Pairs                  []components.FieldValuePair       `json:"kv_pairs"`
+	Count                  int64                             `json:"count"`
+	SearchURL              string                            `json:"search_url,omitempty"`
+	CenqlQuery             string                            `json:"cenql_query,omitempty"`
+	IsInteresting          bool                              `json:"is_interesting"`
+	HistoricalObservations []components.HostObservationRange `json:"historical_observations,omitempty"`
 }
 
 func (r *Report) GetReferrer() *Referrer {

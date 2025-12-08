@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/censys/censys-sdk-go/models/components"
 	"github.com/censys/censys-sdk-go/models/operations"
@@ -93,10 +94,73 @@ func (c *Censeye) getCounts(ctx context.Context, host string, rules [][]componen
 		}
 	}
 
-	// we need to join our entries.
+	// we need to join our entries and collect certificate history pivots
 	entries := make([]*reportEntry, 0, len(rules))
+	certHistoryPivots := make(map[string]*time.Time)
+
 	for i, count := range allCounts {
-		entries = append(entries, c.makeEntry(rules[i], count))
+		entry := c.makeEntry(rules[i], count)
+
+		// Special case for certificate fields with count <= 1
+		// Fetch historical observations to see if this certificate was seen elsewhere in the past
+		if count <= 1 {
+			for _, pair := range entry.Pairs {
+				field := pair.GetField()
+				// Check if this is a certificate fingerprint field
+				if field == "host.services.cert.fingerprint_sha256" {
+					certValue := pair.GetValue()
+					logForHost(host).Debugf("Fetching historical observations for certificate: %s (count=%d)", certValue, count)
+
+					// Look back 365 days for historical observations
+					const daysLookback = 365
+					obs, err := c.getCertificateObservations(ctx, certValue, daysLookback)
+					if err != nil {
+						logForHost(host).Warnf("Failed to fetch historical observations for certificate %s: %v", certValue, err)
+					} else if len(obs) > 1 {
+						// if we only get one returned observation, it means it only matched the host we are running against.
+						// Only store if we have more than one observation (meaning seen elsewhere)
+						entry.HistoricalObservations = obs
+						logForHost(host).Infof("Found %d historical observations for certificate %s", len(obs), certValue)
+
+						// Collect IPs and their median timestamps for potential pivots
+						ipToTimes := make(map[string][]time.Time)
+						for _, ob := range obs {
+							ip := ob.GetIP()
+							if ip == "" || ip == host {
+								continue // Skip empty IPs and the current host
+							}
+
+							startTime := ob.GetStartTime()
+							endTime := ob.GetEndTime()
+
+							if !startTime.IsZero() {
+								ipToTimes[ip] = append(ipToTimes[ip], startTime)
+							}
+							if !endTime.IsZero() && !endTime.Equal(startTime) {
+								ipToTimes[ip] = append(ipToTimes[ip], endTime)
+							}
+						}
+
+						// Calculate median timestamp for each IP
+						for ip, times := range ipToTimes {
+							if len(times) > 0 {
+								// Sort times to get median
+								sort.Slice(times, func(i, j int) bool {
+									return times[i].Before(times[j])
+								})
+								medianIdx := len(times) / 2
+								medianTime := times[medianIdx]
+								certHistoryPivots[ip] = &medianTime
+								logForHost(host).Debugf("Certificate history pivot: %s at %s", ip, medianTime.Format(time.RFC3339Nano))
+							}
+						}
+					}
+					break // only check the first certificate field
+				}
+			}
+		}
+
+		entries = append(entries, entry)
 	}
 
 	// sort by count descending
@@ -114,8 +178,9 @@ func (c *Censeye) getCounts(ctx context.Context, host string, rules [][]componen
 	c.sendStatus(fmt.Sprintf("fetched value-counts (%d) for host %s... DONE!", len(entries), host))
 
 	return &Report{
-		Host:    host,
-		Data:    entries,
-		Credits: len(uncachedRules),
+		Host:              host,
+		Data:              entries,
+		Credits:           len(uncachedRules),
+		CertHistoryPivots: certHistoryPivots,
 	}, nil
 }
