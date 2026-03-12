@@ -272,8 +272,14 @@ func (c *Censeye) applyRegexFilters(pairs [][]components.FieldValuePair) [][]com
 	regexes := c.config.GetRegexFilters()
 
 	for _, pair := range pairs {
-		ent := &reportEntry{Pairs: pair}
-		cql := ent.ToCenqlQuery()
+		pairsLike := make([]FieldValuePairLike, len(pair))
+		for j := range pair {
+			pairsLike[j] = stdFieldValuePair{pair[j]}
+		}
+		ent := &reportEntry{pairs: pairsLike}
+		ent.SearchURL = ent.ToURL()
+		ent.CenqlQuery = ent.ToCenqlQuery()
+		cql := ent.CenqlQuery
 
 		skip := false
 		for _, rgx := range regexes {
@@ -353,8 +359,14 @@ func ValueCountsInputBodyToCenql(input *components.SearchValueCountsInputBody) (
 	// func (c *Censeye) makeEntry(pairs []components.FieldValuePair, count uint64) *reportEntry {
 	entries := make([]string, 0, len(input.AndCountConditions))
 	for _, condition := range input.AndCountConditions {
-		ent := &reportEntry{Pairs: condition.FieldValuePairs}
-		cql := ent.ToCenqlQuery()
+		pairsLike := make([]FieldValuePairLike, len(condition.FieldValuePairs))
+		for j := range condition.FieldValuePairs {
+			pairsLike[j] = stdFieldValuePair{condition.FieldValuePairs[j]}
+		}
+		ent := &reportEntry{pairs: pairsLike}
+		ent.SearchURL = ent.ToURL()
+		ent.CenqlQuery = ent.ToCenqlQuery()
+		cql := ent.CenqlQuery
 		if cql == "" {
 			continue
 		}

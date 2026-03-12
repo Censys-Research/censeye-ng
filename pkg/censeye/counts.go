@@ -11,9 +11,9 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func (c *Censeye) makeEntry(pairs []components.FieldValuePair, count uint64) *reportEntry {
+func (c *Censeye) makeEntry(pairs []FieldValuePairLike, count uint64) *reportEntry {
 	entry := &reportEntry{
-		Pairs:         pairs,
+		pairs:         pairs,
 		Count:         int64(count),
 		IsInteresting: c.config.Rarity.IsInteresting(count),
 	}
@@ -21,6 +21,99 @@ func (c *Censeye) makeEntry(pairs []components.FieldValuePair, count uint64) *re
 	entry.SearchURL = entry.ToURL()
 	entry.CenqlQuery = entry.ToCenqlQuery()
 	return entry
+}
+
+type FVPLegacyType string
+
+const (
+	FVPLegacyTypeWildcard FVPLegacyType = "wildcard"
+	FVPLegacyTypeRegex    FVPLegacyType = "regex"
+)
+
+type FVPLegacy struct {
+	components.FieldValuePair
+	Type FVPLegacyType
+}
+
+// GetField and GetValue implement FieldValuePairLike (value receiver so FVPLegacy implements the interface).
+func (f FVPLegacy) GetField() string { return f.Field }
+func (f FVPLegacy) GetValue() string { return f.Value }
+
+// CenqlOperator implements FieldValuePairLike for regex (=~) vs wildcard/exact (=).
+func (f FVPLegacy) CenqlOperator() string {
+	if f.Type == FVPLegacyTypeRegex {
+		return "=~"
+	} else if f.Type == FVPLegacyTypeWildcard {
+		return ":"
+	}
+	return "="
+}
+
+func (c *Censeye) GetCountsLegacy(ctx context.Context, host string, rules []FVPLegacy) (*Report, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("censeye is not initialized")
+	}
+
+	c.sendStatus(fmt.Sprintf("fetching value-counts (%d) for host %s...", len(rules), host))
+
+	allCounts := make([]uint64, len(rules))
+
+	for i, pair := range rules {
+		logForHost(host).Debugf("rule: %s %s %s", pair.Type, pair.GetField(), pair.GetValue())
+
+		op := ":"
+		switch pair.Type {
+		case FVPLegacyTypeWildcard:
+			op = ":"
+		case FVPLegacyTypeRegex:
+			op = "=~"
+		}
+
+		q := fmt.Sprintf("%s%s`%s`", pair.GetField(), op, pair.GetValue())
+
+		logForHost(host).Infof("query: %s", q)
+
+		res, err := c.client.GlobalData.Aggregate(ctx, operations.V3GlobaldataSearchAggregateRequest{
+			SearchAggregateInputBody: components.SearchAggregateInputBody{
+				Field:           "host.ip", // TODO: we should also process web.endpoint.ip
+				NumberOfBuckets: 1,         // we only need 1 to get total
+				Query:           q,
+			},
+		})
+
+		if err != nil {
+			log.Warnf("Error fetching count for rule %v: %v", pair, err)
+			allCounts[i] = 0
+			continue
+		}
+
+		tot := res.GetResponseEnvelopeSearchAggregateResponse().GetResult().GetTotalCount()
+		allCounts[i] = uint64(tot)
+
+		if log.GetLevel() >= log.DebugLevel {
+			j, _ := json.MarshalIndent(res, "", "  ")
+			logForHost(host).Debugf("raw response: %s", string(j))
+		}
+	}
+
+	// Build report entries using FieldValuePairLike (FVPLegacy implements it).
+	entries := make([]*reportEntry, 0, len(rules))
+	for i, count := range allCounts {
+		pairs := []FieldValuePairLike{rules[i]}
+		entries = append(entries, c.makeEntry(pairs, count))
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Count > entries[j].Count
+	})
+
+	c.sendStatus(fmt.Sprintf("fetched value-counts (%d) for host %s... DONE!", len(entries), host))
+
+	return &Report{
+		Host:    host,
+		Data:    entries,
+		Credits: len(rules),
+	}, nil
 }
 
 func (c *Censeye) getCounts(ctx context.Context, host string, rules [][]components.FieldValuePair) (*Report, error) {
@@ -96,7 +189,11 @@ func (c *Censeye) getCounts(ctx context.Context, host string, rules [][]componen
 	// we need to join our entries.
 	entries := make([]*reportEntry, 0, len(rules))
 	for i, count := range allCounts {
-		entries = append(entries, c.makeEntry(rules[i], count))
+		pairs := make([]FieldValuePairLike, len(rules[i]))
+		for j := range rules[i] {
+			pairs[j] = stdFieldValuePair{rules[i][j]}
+		}
+		entries = append(entries, c.makeEntry(pairs, count))
 	}
 
 	// sort by count descending

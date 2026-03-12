@@ -10,6 +10,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// LLMConfig holds optional LLM/AnalyzeHTML settings (API key, endpoint, model, min body size).
+type LLMConfig struct {
+	APIKey        string `yaml:"api_key,omitempty"`
+	Endpoint      string `yaml:"endpoint,omitempty"`
+	Model         string `yaml:"model,omitempty"`
+	MinBodyBytes  int    `yaml:"min_body_bytes,omitempty"` // minimum HTTP body size in bytes to send to the LLM
+}
+
 type Config struct {
 	Workdir          string            `yaml:"workdir,omitempty"`
 	ExtractionRules  []*ExtractionRule `yaml:"extraction_rules,omitempty"`
@@ -20,6 +28,7 @@ type Config struct {
 	Rarity           *Rarity           `yaml:"rarity,omitempty"`
 	CacheDuration    time.Duration     `yaml:"cache_duration,omitempty"`
 	Workers          int               `yaml:"workers,omitempty"`
+	LLM              *LLMConfig       `yaml:"llm,omitempty"`
 }
 
 type ExtractionRule struct {
@@ -70,6 +79,13 @@ func (c *Config) GetPivotableFields() []string {
 	}
 
 	return c.PivotableFields
+}
+
+func (c *Config) GetLLM() *LLMConfig {
+	if c == nil {
+		return nil
+	}
+	return c.LLM
 }
 
 func (r *Rarity) IsInteresting(value uint64) bool {
@@ -140,6 +156,12 @@ func WithWorkdir(workdir string) ConfigOption {
 func WithPivotableFields(fields []string) ConfigOption {
 	return func(c *Config) {
 		c.PivotableFields = fields
+	}
+}
+
+func WithLLM(llm *LLMConfig) ConfigOption {
+	return func(c *Config) {
+		c.LLM = llm
 	}
 }
 

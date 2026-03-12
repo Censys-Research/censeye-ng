@@ -8,12 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/censys-research/censeye-ng/pkg/cache"
 	"github.com/censys-research/censeye-ng/pkg/config"
 	censys "github.com/censys/censys-sdk-go"
+	"github.com/censys/censys-sdk-go/models/components"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/sync/errgroup"
@@ -77,6 +79,13 @@ func WithClient(client *censys.SDK) Option {
 func WithStatusCallback(callback func(message string)) Option {
 	return func(c *Censeye) {
 		c.statusCb = callback
+	}
+}
+
+// WithLLMClient sets the optional LLM client for analyzing HTTP bodies (e.g. when --analyze-html is set).
+func WithLLMClient(client LLMRegexExtractor) Option {
+	return func(c *Censeye) {
+		c.llmClient = client
 	}
 }
 
@@ -148,7 +157,7 @@ func (c *Censeye) collectHosts(ctx context.Context, viahost string, rep *Report,
 			log.Debugf("checking entry %s against pivotable fields: %v", entry.CenqlQuery, pivotable)
 			hasfield := false
 
-			for _, pair := range entry.Pairs {
+			for _, pair := range entry.GetPairs() {
 				if slices.Contains(pivotable, pair.GetField()) {
 					hasfield = true
 					log.Debugf("entry %s contains pivotable field: %s", entry.CenqlQuery, pair.GetField())
@@ -225,6 +234,67 @@ func (c *Censeye) runPivots(
 	report, err := c.getCounts(ctx, task.host, rules)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// optional: analyze HTTP bodies with LLM and add legacy regex counts
+	if c.llmClient != nil {
+		minBodyBytes := 200
+		if llm := c.config.GetLLM(); llm != nil && llm.MinBodyBytes > 0 {
+			minBodyBytes = llm.MinBodyBytes
+		}
+		entries := extractHTTPBodiesWithHash(res, minBodyBytes)
+		var allRegexes []string
+		seenRegex := make(map[string]struct{})
+		for _, e := range entries {
+			regexes, ok := c.loadBodyLLMCache(e.Hash)
+			if !ok {
+				var err error
+				regexes, err = c.llmClient.RunExtractRegexFromBody(ctx, e.Body)
+				if err != nil {
+					logForHost(task.host).Warnf("LLM extract regex for body %s: %v", e.Hash, err)
+					continue
+				}
+				if err := c.saveBodyLLMCache(e.Hash, regexes); err != nil {
+					logForHost(task.host).Warnf("save body LLM cache: %v", err)
+				}
+			}
+			for _, r := range regexes {
+				if r == "" {
+					continue
+				}
+				if _, ok := seenRegex[r]; !ok {
+					seenRegex[r] = struct{}{}
+					allRegexes = append(allRegexes, r)
+				}
+				logForHost(task.host).Debugf("found regex: %s", r)
+			}
+		}
+		if len(allRegexes) > 0 {
+			legacyRules := make([]FVPLegacy, len(allRegexes))
+			for i, r := range allRegexes {
+				value := r // strconv.Quote(r)
+				log.Infof("adding LLM-generated body regex to legacy rules: %s", value)
+
+				legacyRules[i] = FVPLegacy{
+					FieldValuePair: components.FieldValuePair{
+						Field: "host.services.endpoints.http.body",
+						Value: value,
+					},
+					//Type: FVPLegacyTypeWildcard,
+					Type: FVPLegacyTypeRegex,
+				}
+			}
+			legacyReport, err := c.GetCountsLegacy(ctx, task.host, legacyRules)
+			if err != nil {
+				logForHost(task.host).Warnf("GetCountsLegacy for body regexes: %v", err)
+			} else {
+				report.Data = append(report.Data, legacyReport.Data...)
+				report.Credits += legacyReport.Credits
+				sort.Slice(report.Data, func(i, j int) bool {
+					return report.Data[i].Count > report.Data[j].Count
+				})
+			}
+		}
 	}
 
 	report.Depth = task.depth

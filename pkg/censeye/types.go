@@ -1,6 +1,8 @@
 package censeye
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -16,17 +18,23 @@ import (
 type Option func(*Censeye)
 type RunOpt func(*runOpts)
 
+// LLMRegexExtractor is implemented by clients that can extract re2 regex patterns from an HTTP body (e.g. for analyze-html).
+type LLMRegexExtractor interface {
+	RunExtractRegexFromBody(ctx context.Context, body string) ([]string, error)
+}
+
 // StatusCallback is a simple callback that receives status update strings
 type StatusCallback func(message string)
 
 // Censeye is the main struct that holds the configuration, client, cache, credits, and a status callback.
 type Censeye struct {
 	sync.Mutex
-	config   *config.Config
-	client   *censys.SDK
-	cache    *cache.Manager
-	credits  int
-	statusCb StatusCallback
+	config    *config.Config
+	client    *censys.SDK
+	cache     *cache.Manager
+	credits   int
+	statusCb  StatusCallback
+	llmClient LLMRegexExtractor
 }
 
 type runState struct {
@@ -60,12 +68,31 @@ type Referrer struct {
 	Via  []*reportEntry `json:"via"`
 }
 
+// FieldValuePairLike is an interface for key-value pairs used in report entries.
+// It allows both the SDK's FieldValuePair and legacy/wrapper types (e.g. regex)
+// to be used when building CenQL queries and URLs. CenqlOperator() controls the
+// operator in the output (e.g. "=" for exact/wildcard, "=~" for regex).
+type FieldValuePairLike interface {
+	GetField() string
+	GetValue() string
+	CenqlOperator() string // "=" for exact/wildcard, "=~" for regex
+}
+
+// stdFieldValuePair adapts components.FieldValuePair to FieldValuePairLike with operator "=".
+type stdFieldValuePair struct {
+	components.FieldValuePair
+}
+
+func (s stdFieldValuePair) GetField() string   { return s.Field }
+func (s stdFieldValuePair) GetValue() string   { return s.Value }
+func (s stdFieldValuePair) CenqlOperator() string { return "=" }
+
 type reportEntry struct {
-	Pairs         []components.FieldValuePair `json:"kv_pairs"`
-	Count         int64                       `json:"count"`
-	SearchURL     string                      `json:"search_url,omitempty"`
-	CenqlQuery    string                      `json:"cenql_query,omitempty"`
-	IsInteresting bool                        `json:"is_interesting"`
+	pairs         []FieldValuePairLike
+	Count         int64  `json:"count"`
+	SearchURL     string `json:"search_url,omitempty"`
+	CenqlQuery    string `json:"cenql_query,omitempty"`
+	IsInteresting bool  `json:"is_interesting"`
 }
 
 func (r *Report) GetReferrer() *Referrer {
@@ -132,10 +159,33 @@ func (r *reportEntry) GetCenqlQuery() string {
 }
 
 func (r *reportEntry) GetPairs() []components.FieldValuePair {
-	if r == nil {
+	if r == nil || len(r.pairs) == 0 {
 		return nil
 	}
-	return r.Pairs
+	out := make([]components.FieldValuePair, len(r.pairs))
+	for i, p := range r.pairs {
+		out[i] = components.FieldValuePair{Field: p.GetField(), Value: p.GetValue()}
+	}
+	return out
+}
+
+// MarshalJSON implements json.Marshaler so kv_pairs is emitted as [{"field","value"},...].
+func (r *reportEntry) MarshalJSON() ([]byte, error) {
+	type pairJSON struct {
+		Field string `json:"field"`
+		Value string `json:"value"`
+	}
+	kv := make([]pairJSON, len(r.pairs))
+	for i, p := range r.pairs {
+		kv[i] = pairJSON{Field: p.GetField(), Value: p.GetValue()}
+	}
+	return json.Marshal(struct {
+		KvPairs        []pairJSON `json:"kv_pairs"`
+		Count          int64      `json:"count"`
+		SearchURL      string     `json:"search_url,omitempty"`
+		CenqlQuery     string     `json:"cenql_query,omitempty"`
+		IsInteresting  bool       `json:"is_interesting"`
+	}{kv, r.Count, r.SearchURL, r.CenqlQuery, r.IsInteresting})
 }
 
 func (r *reportEntry) GetSearchURL() string {
@@ -147,17 +197,18 @@ func (r *reportEntry) GetSearchURL() string {
 
 // ToCenqlShort converts the report entry to a (raw) CenQL query format (non-urlized) with a shortened (non-standard) output.
 func (r *reportEntry) ToCenqlShort() (string, string, int64) {
-	if len(r.Pairs) == 0 {
+	if len(r.pairs) == 0 {
 		return "", "", 0
 	}
 
-	if len(r.Pairs) == 1 {
-		return r.Pairs[0].Field, fmt.Sprintf("%q", r.Pairs[0].Value), r.Count
+	if len(r.pairs) == 1 {
+		p := r.pairs[0]
+		return p.GetField(), p.CenqlOperator() + " " + fmt.Sprintf("%q", p.GetValue()), r.Count
 	}
 
-	splitf := make([][]string, len(r.Pairs))
-	for i, pair := range r.Pairs {
-		splitf[i] = strings.Split(pair.Field, ".")
+	splitf := make([][]string, len(r.pairs))
+	for i, pair := range r.pairs {
+		splitf[i] = strings.Split(pair.GetField(), ".")
 	}
 
 	// now find the longest common prefix...
@@ -179,35 +230,38 @@ func (r *reportEntry) ToCenqlShort() (string, string, int64) {
 
 	pfx := strings.Join(pfxp, ".")
 
-	// now build out the field=val with the prefix removed...
-	out := make([]string, len(r.Pairs))
-	for i, pair := range r.Pairs {
-		field := pair.Field
+	// now build out the field op val with the prefix removed...
+	out := make([]string, len(r.pairs))
+	for i, pair := range r.pairs {
+		field := pair.GetField()
 		if pfx != "" {
-			field = strings.TrimPrefix(pair.Field, pfx+".")
+			field = strings.TrimPrefix(pair.GetField(), pfx+".")
 		}
-		out[i] = fmt.Sprintf("%s=%q", field, pair.Value)
+		out[i] = fmt.Sprintf("%s %s %q", field, pair.CenqlOperator(), pair.GetValue())
 	}
 
 	return pfx, fmt.Sprintf("(%s)", strings.Join(out, " and ")), r.Count
 }
 
-// ToCenql converts the report entry to a (raw) CenQL query format (non-urlized)
+// ToCenql converts the report entry to a (raw) CenQL query format (non-urlized).
+// For a single pair, v is "op \"value\"" so the full query is field + " " + v.
 func (r *reportEntry) ToCenql() (string, string, int64) {
-	if len(r.Pairs) == 0 {
+	if len(r.pairs) == 0 {
 		return "", "", 0
 	}
 
 	const pfx = "host.services"
 
-	if len(r.Pairs) == 1 {
-		return r.Pairs[0].Field, fmt.Sprintf("%q", r.Pairs[0].Value), r.Count
+	if len(r.pairs) == 1 {
+		p := r.pairs[0]
+		v := p.CenqlOperator() + " " + fmt.Sprintf("%q", p.GetValue())
+		return p.GetField(), v, r.Count
 	}
 
-	out := make([]string, len(r.Pairs))
-	for i, pair := range r.Pairs {
-		field := strings.TrimPrefix(pair.Field, pfx+".")
-		out[i] = fmt.Sprintf("%s=%q", field, pair.Value)
+	out := make([]string, len(r.pairs))
+	for i, pair := range r.pairs {
+		field := strings.TrimPrefix(pair.GetField(), pfx+".")
+		out[i] = fmt.Sprintf("%s %s %q", field, pair.CenqlOperator(), pair.GetValue())
 	}
 
 	return pfx, fmt.Sprintf("(%s)", strings.Join(out, " and ")), r.Count
@@ -216,9 +270,8 @@ func (r *reportEntry) ToCenql() (string, string, int64) {
 func (r *reportEntry) ToCenqlQuery() string {
 	k, v, _ := r.ToCenql()
 	if !strings.HasPrefix(v, "(") {
-		return fmt.Sprintf("%s=%s", k, v)
+		return k + " " + v
 	}
-
 	return fmt.Sprintf("%s:%s", k, v)
 }
 

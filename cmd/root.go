@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/briandowns/spinner"
+	"github.com/censys-research/censeye-ng/pkg/aianalyzer"
 	"github.com/censys-research/censeye-ng/pkg/censeye"
 	"github.com/censys-research/censeye-ng/pkg/config"
 	censys "github.com/censys/censys-sdk-go"
+	"github.com/censys/censys-sdk-go/models/components"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -41,6 +43,8 @@ var (
 	atTime          string                        // fetch historical information from a specific host
 	showConf        = false                       // show the configuration file in yaml format before running the command
 	pivotableFields []string                      // fields that should be considered for pivoting when depth > 1
+	analyzeHtml     = false                       // analyze HTML content for pivots using an LLM.
+	useTestFeature  = false                       // enable test features (for development purposes only
 )
 
 func report(w io.Writer, rep []*censeye.Report) {
@@ -161,6 +165,16 @@ func runCenseye(cmd *cobra.Command, args []string) {
 	if len(pivotableFields) > 0 {
 		conf.PivotableFields = pivotableFields
 	}
+
+	var llmClient *aianalyzer.Client
+	if analyzeHtml {
+		llmClient = aianalyzer.NewFromEnv()
+		if !llmClient.Cfg().Valid() {
+			log.Fatalf("--analyze-html requires %s and %s to be set with a valid API key and endpoint URL", aianalyzer.DefaultAPIKeyEnv, aianalyzer.DefaultEndpointEnv)
+		}
+		log.Print("LLM analyzer enabled")
+	}
+
 	if depth > 0 && conf.Rarity.Max >= 100 {
 		log.Warn("Setting depth > 0 with a pivot threshold >= 100 may lead to a LOT queries. Consider adjusting the pivot threshold. Ctrl+C to cancel.")
 		time.Sleep(5 * time.Second)
@@ -182,14 +196,18 @@ func runCenseye(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	ce := censeye.New(
+	ceOpts := []censeye.Option{
 		censeye.WithClient(censys.New(
 			censys.WithSecurity(token),
 			censys.WithOrganizationID(org),
 		)),
 		censeye.WithConfig(conf),
 		censeye.WithStatusCallback(statuscb),
-	)
+	}
+	if llmClient != nil {
+		ceOpts = append(ceOpts, censeye.WithLLMClient(llmClient))
+	}
+	ce := censeye.New(ceOpts...)
 
 	buildOpts := func() []censeye.RunOpt {
 		opts := []censeye.RunOpt{censeye.WithDepth(depth)}
@@ -202,6 +220,24 @@ func runCenseye(cmd *cobra.Command, args []string) {
 			}
 		}
 		return opts
+	}
+
+	if useTestFeature {
+		host := parseIP(args[0])
+		res, err := ce.GetCountsLegacy(ctx, host, []censeye.FVPLegacy{
+			{
+				FieldValuePair: components.FieldValuePair{
+					Field: "host.services.banner_hex",
+					Value: "^4854.*",
+				},
+				Type: censeye.FVPLegacyTypeRegex},
+		})
+
+		fmt.Printf("legacy counts result: %+v, err: %v\n", res, err)
+		j, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Printf("legacy counts result JSON: %s\n", string(j))
+
+		//os.Exit(0)
 	}
 
 	if len(args) == 0 {
@@ -312,6 +348,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&atTime, "at", "a", "", "Fetch host data from a specific date (e.g., '2023-10-01 12:00:00')")
 	rootCmd.PersistentFlags().StringVar(&atTime, "at-time", "", "alias for --at")
 	rootCmd.PersistentFlags().BoolVar(&showConf, "showconf", showConf, "Show the configuration file in YAML format before running the command")
+	rootCmd.PersistentFlags().BoolVar(&analyzeHtml, "analyze-html", false, "Analyze HTML content for pivots using an LLM")
+	rootCmd.PersistentFlags().BoolVar(&useTestFeature, "test-feature", false, "Enable test features (for development purposes only)")
 
 	cobra.OnInitialize(initLogging)
 }
