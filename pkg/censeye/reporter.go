@@ -237,6 +237,16 @@ func (r *Reporter) buildTreeFromNodes(t treeprint.Tree, nodes []*PivotNode) {
 			host := r.linkHost(node.IP)
 			hostWithTags := r.formatHostWithTags(host, node.Labels, node.Threats)
 			branch := t.AddBranch(hostWithTags)
+
+			// if this host was found via more than one of the parent's queries,
+			// list the additional matching queries beneath it.
+			if len(node.AlsoVia) > 0 {
+				alsoBranch := branch.AddBranch("⋮ also via:")
+				for _, q := range node.AlsoVia {
+					alsoBranch.AddNode(r.formatViaQuery(q))
+				}
+			}
+
 			r.buildTreeFromNodes(branch, node.Children)
 		}
 	}
@@ -359,6 +369,7 @@ type PivotNode struct {
 	IP       string       `json:"ip,omitempty"`
 	Depth    int          `json:"depth,omitempty"`
 	Via      string       `json:"via,omitempty"`
+	AlsoVia  []string     `json:"also_via,omitempty"`
 	Labels   []string     `json:"labels,omitempty"`
 	Threats  []string     `json:"threats,omitempty"`
 	Children []*PivotNode `json:"children,omitempty"`
@@ -374,6 +385,7 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 		ip      string
 		depth   int
 		via     string
+		alsoVia []string
 		parent  string
 		labels  []string
 		threats []string
@@ -384,10 +396,16 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 		parent := ""
 		depth := 0
 		via := ""
+		var alsoVia []string
 
 		if ref := rep.GetReferrer(); ref != nil {
 			parent = ref.GetHost()
 			via = ref.GetVia().GetCenqlQuery()
+			// the host may have matched more than one of the parent's queries;
+			// the first is used for grouping, the rest are surfaced per-host.
+			for _, entry := range ref.GetAllVia()[min(1, len(ref.GetAllVia())):] {
+				alsoVia = append(alsoVia, entry.GetCenqlQuery())
+			}
 			if parentNode, ok := nodes[parent]; ok {
 				depth = parentNode.depth + 1
 			}
@@ -397,6 +415,7 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 			ip:      rep.Host,
 			depth:   depth,
 			via:     via,
+			alsoVia: alsoVia,
 			parent:  parent,
 			labels:  rep.Labels,
 			threats: rep.Threats,
@@ -434,6 +453,7 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 				ipNodes = append(ipNodes, &PivotNode{
 					IP:       child.ip,
 					Depth:    child.depth,
+					AlsoVia:  child.alsoVia,
 					Labels:   child.labels,
 					Threats:  child.threats,
 					Children: build(child.ip),
@@ -458,6 +478,7 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 				groupChildren = append(groupChildren, &PivotNode{
 					IP:       child.ip,
 					Depth:    child.depth,
+					AlsoVia:  child.alsoVia,
 					Labels:   child.labels,
 					Threats:  child.threats,
 					Children: build(child.ip),
