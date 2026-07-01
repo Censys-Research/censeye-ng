@@ -231,6 +231,13 @@ func (r *Reporter) buildTreeFromNodes(t treeprint.Tree, nodes []*PivotNode) {
 			formattedQuery := r.formatViaQuery(node.Via)
 			label := fmt.Sprintf("via: %s", formattedQuery)
 			viaBranch := t.AddBranch(label)
+
+			// queries shared by every host in this group are hoisted here so
+			// they aren't repeated under each host.
+			if len(node.AlsoVia) > 0 {
+				r.addAlsoViaBranch(viaBranch, fmt.Sprintf("⋮ also via (all %d hosts):", len(node.Children)), node.AlsoVia)
+			}
+
 			r.buildTreeFromNodes(viaBranch, node.Children)
 		} else {
 			// This is an IP node
@@ -238,17 +245,25 @@ func (r *Reporter) buildTreeFromNodes(t treeprint.Tree, nodes []*PivotNode) {
 			hostWithTags := r.formatHostWithTags(host, node.Labels, node.Threats)
 			branch := t.AddBranch(hostWithTags)
 
-			// if this host was found via more than one of the parent's queries,
-			// list the additional matching queries beneath it.
-			if len(node.AlsoVia) > 0 {
-				alsoBranch := branch.AddBranch("⋮ also via:")
-				for _, q := range node.AlsoVia {
-					alsoBranch.AddNode(r.formatViaQuery(q))
-				}
-			}
+			// any queries unique to this host (i.e. not shared by the whole
+			// group and hoisted to the parent) are listed beneath it.
+			r.addAlsoViaBranch(branch, "⋮ also via:", node.AlsoVia)
 
 			r.buildTreeFromNodes(branch, node.Children)
 		}
+	}
+}
+
+// addAlsoViaBranch adds a labeled branch listing the given "also via" queries.
+// It is a no-op when there are no queries to show.
+func (r *Reporter) addAlsoViaBranch(t treeprint.Tree, label string, queries []string) {
+	if len(queries) == 0 {
+		return
+	}
+
+	b := t.AddBranch(label)
+	for _, q := range queries {
+		b.AddNode(r.formatViaQuery(q))
 	}
 }
 
@@ -484,8 +499,24 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 					Children: build(child.ip),
 				})
 			}
+
+			// hoist "also via" queries shared by every host in the group up to
+			// the group node, and strip them from each host so only its unique
+			// queries remain listed beneath it.
+			shared := commonAlsoVia(groupChildren)
+			if len(shared) > 0 {
+				sharedSet := make(map[string]struct{}, len(shared))
+				for _, q := range shared {
+					sharedSet[q] = struct{}{}
+				}
+				for _, gc := range groupChildren {
+					gc.AlsoVia = filterOutQueries(gc.AlsoVia, sharedSet)
+				}
+			}
+
 			viaNodes = append(viaNodes, &PivotNode{
 				Via:      via,
+				AlsoVia:  shared,
 				Children: groupChildren,
 			})
 		}
@@ -505,6 +536,52 @@ func (r *Reporter) CreatePivotTree(reports []*Report) []*PivotNode {
 	}
 
 	return jsonRoots
+}
+
+// commonAlsoVia returns the "also via" queries present on every host in the
+// group, preserving the order they appear on the first host. It returns nil
+// for groups smaller than two hosts, where there is nothing to collapse.
+func commonAlsoVia(children []*PivotNode) []string {
+	if len(children) < 2 {
+		return nil
+	}
+
+	counts := make(map[string]int)
+	for _, c := range children {
+		seen := make(map[string]struct{})
+		for _, q := range c.AlsoVia {
+			if _, ok := seen[q]; ok {
+				continue // dedup within a single host
+			}
+			seen[q] = struct{}{}
+			counts[q]++
+		}
+	}
+
+	var common []string
+	seen := make(map[string]struct{})
+	for _, q := range children[0].AlsoVia {
+		if _, ok := seen[q]; ok {
+			continue
+		}
+		seen[q] = struct{}{}
+		if counts[q] == len(children) {
+			common = append(common, q)
+		}
+	}
+
+	return common
+}
+
+// filterOutQueries returns items with any element in remove dropped, preserving order.
+func filterOutQueries(items []string, remove map[string]struct{}) []string {
+	var out []string
+	for _, it := range items {
+		if _, ok := remove[it]; !ok {
+			out = append(out, it)
+		}
+	}
+	return out
 }
 
 func (r *Reporter) printPivot(p iPivot) {

@@ -54,3 +54,40 @@ func TestPivotTreeShowsAlsoVia(t *testing.T) {
 		t.Fatalf("expected third matching query (body_hash) in output, got:\n%s", out)
 	}
 }
+
+func TestPivotTreeHoistsSharedAlsoVia(t *testing.T) {
+	primary := entry("host.services.cert.fingerprint_sha256", "0750f2")
+	subjectDN := entry("host.services.cert.parsed.subject_dn", "CN=chessroyale.app")
+	commonName := entry("host.services.cert.parsed.subject.common_name", "chessroyale.app")
+	bodyHash := entry("host.services.endpoints.http.body_hash_sha256", "4a66f6")
+
+	reports := []*Report{
+		{Host: "1.1.1.1", Depth: 0},
+		// three hosts share {subjectDN, commonName}; one also has bodyHash.
+		{Host: "3.124.61.92", Depth: 1, Referrer: &Referrer{Host: "1.1.1.1", Via: []*reportEntry{primary, subjectDN, commonName}}},
+		{Host: "3.125.201.74", Depth: 1, Referrer: &Referrer{Host: "1.1.1.1", Via: []*reportEntry{primary, subjectDN, commonName}}},
+		{Host: "35.159.75.206", Depth: 1, Referrer: &Referrer{Host: "1.1.1.1", Via: []*reportEntry{primary, subjectDN, commonName, bodyHash}}},
+	}
+
+	var buf bytes.Buffer
+	r := NewReporter(&buf, "no-colors", "no-links")
+	r.PivotTree(reports)
+
+	out := buf.String()
+	t.Logf("\n%s", out)
+
+	// the shared queries should be hoisted once under the group node.
+	if !strings.Contains(out, "also via (all 3 hosts):") {
+		t.Fatalf("expected hoisted shared-via section, got:\n%s", out)
+	}
+	if strings.Count(out, "common_name=\"chessroyale.app\"") != 1 {
+		t.Fatalf("expected shared common_name query listed exactly once, got:\n%s", out)
+	}
+	if strings.Count(out, "subject_dn=\"CN=chessroyale.app\"") != 1 {
+		t.Fatalf("expected shared subject_dn query listed exactly once, got:\n%s", out)
+	}
+	// the body_hash query is unique to one host and must remain under it.
+	if strings.Count(out, "body_hash_sha256=\"4a66f6\"") != 1 {
+		t.Fatalf("expected unique body_hash query listed once under its host, got:\n%s", out)
+	}
+}
