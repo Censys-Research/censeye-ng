@@ -47,6 +47,10 @@ var DefaultExtractionRules = []*ExtractionRule{
 	{
 		Fields: []string{"ja4tscan.fingerprint", "banner_hash_sha256"},
 	},
+	{
+		// see services.jarm.fingerprint + services.banner_hash_sha256
+		Fields: []string{"jarm.fingerprint", "banner_hash_sha256"},
+	},
 }
 
 // these are things we want to filter out (by default) from the rule generation
